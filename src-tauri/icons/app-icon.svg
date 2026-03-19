@@ -1,0 +1,43 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="256" fill="#1e3a8a"/>
+  
+  <!-- Document icon -->
+  <g transform="translate(130, 100)">
+    <!-- Main document -->
+    <rect x="0" y="0" width="180" height="240" rx="8" fill="#ffffff" stroke="#e5e7eb" stroke-width="2"/>
+    <!-- Folded corner -->
+    <path d="M150 0 L180 30 L150 30 Z" fill="#e5e7eb"/>
+    
+    <!-- Document lines -->
+    <rect x="20" y="50" width="120" height="4" fill="#9ca3af"/>
+    <rect x="20" y="70" width="100" height="4" fill="#9ca3af"/>
+    <rect x="20" y="90" width="130" height="4" fill="#9ca3af"/>
+    <rect x="20" y="110" width="90" height="4" fill="#9ca3af"/>
+    
+    <!-- DOCX text -->
+    <text x="90" y="190" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#6b7280">DOCX</text>
+  </g>
+  
+  <!-- Arrow transformation -->
+  <g transform="translate(320, 200)">
+    <!-- Arrow -->
+    <path d="M0 10 L30 10 L25 5 M30 10 L25 15" stroke="#fbbf24" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="45" cy="10" r="8" fill="#fbbf24"/>
+  </g>
+  
+  <!-- HTML document -->
+  <g transform="translate(380, 120)">
+    <rect x="0" y="0" width="100" height="180" rx="8" fill="#ffffff" stroke="#e5e7eb" stroke-width="2"/>
+    <!-- Folded corner -->
+    <path d="M80 0 L100 20 L80 20 Z" fill="#e5e7eb"/>
+    
+    <!-- HTML icon/brackets -->
+    <text x="50" y="80" font-family="Arial, sans-serif" font-size="24" font-weight="bold" text-anchor="middle" fill="#ef4444">&lt;/&gt;</text>
+    <!-- HTML text -->
+    <text x="50" y="140" font-family="Arial, sans-serif" font-size="12" font-weight="bold" text-anchor="middle" fill="#6b7280">HTML</text>
+  </g>
+  
+  <!-- App name -->
+  <text x="256" y="450" font-family="Arial, sans-serif" font-size="32" font-weight="bold" text-anchor="middle" fill="#ffffff">Hermes</text>
+</svg>

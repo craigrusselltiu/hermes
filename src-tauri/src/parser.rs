@@ -1,0 +1,1093 @@
+use crate::model::{
+    BlockElement, Comment, Document, Footnote, HeaderFooter, Run, Style, TableCell, TableRow,
+};
+use base64::Engine;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
+use zip::ZipArchive;
+
+#[derive(Debug, Clone)]
+struct Relationship {
+    id: String,
+    rel_type: String,
+    target: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("File not found or cannot be accessed: {0}")]
+    FileNotFound(std::io::Error),
+    #[error("Not a valid DOCX document: {0}")]
+    NotADocxFile(zip::result::ZipError),
+    #[error("Corrupted XML: {0}")]
+    Xml(quick_xml::Error),
+    #[error("ZIP error: {0}")]
+    Zip(zip::result::ZipError),
+    #[error("Unsupported format: {0}")]
+    UnsupportedFormat(String),
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+    #[error("Missing file: {0}")]
+    MissingFile(String),
+    #[error("Document too large")]
+    DocumentTooLarge(String),
+    #[error("Empty document")]
+    EmptyDocument,
+}
+
+impl From<std::io::Error> for ParseError {
+    fn from(e: std::io::Error) -> Self {
+        ParseError::FileNotFound(e)
+    }
+}
+
+impl From<quick_xml::Error> for ParseError {
+    fn from(e: quick_xml::Error) -> Self {
+        ParseError::Xml(e)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, ParseError>;
+
+pub struct DocxParser {
+    archive: ZipArchive<Cursor<Vec<u8>>>,
+    relationships: Vec<Relationship>,
+}
+
+impl DocxParser {
+    pub fn from_path(path: &str) -> Result<Self> {
+        let mut buffer = Vec::new();
+        std::fs::File::open(path)
+            .map_err(ParseError::FileNotFound)?
+            .read_to_end(&mut buffer)
+            .map_err(ParseError::FileNotFound)?;
+
+        if buffer.is_empty() {
+            return Err(ParseError::EmptyDocument);
+        }
+        if buffer.len() > 100 * 1024 * 1024 {
+            return Err(ParseError::DocumentTooLarge("Exceeds 100 MB".into()));
+        }
+
+        let archive = ZipArchive::new(Cursor::new(buffer)).map_err(ParseError::NotADocxFile)?;
+        let mut parser = Self {
+            archive,
+            relationships: Vec::new(),
+        };
+
+        // Validate required files
+        if parser.archive.by_name("word/document.xml").is_err() {
+            return Err(ParseError::UnsupportedFormat(
+                "Missing word/document.xml".into(),
+            ));
+        }
+
+        // Pre-parse relationships
+        parser.relationships = parser.read_relationships();
+
+        Ok(parser)
+    }
+
+    pub fn parse(&mut self) -> Result<Document> {
+        let mut document = Document::new();
+
+        document.body = self.parse_document_body()?;
+        document.styles = self.parse_styles().unwrap_or_default();
+        document.comments = self.parse_comments().unwrap_or_default();
+        document.images = self.parse_images().unwrap_or_default();
+        let (headers, footers) = self.parse_headers_footers().unwrap_or_default();
+        document.headers = headers;
+        document.footers = footers;
+        document.footnotes = self.parse_footnotes().unwrap_or_default();
+
+        Ok(document)
+    }
+
+    // --- Document body parsing ---
+
+    fn parse_document_body(&mut self) -> Result<Vec<BlockElement>> {
+        let content = self.read_archive_file("word/document.xml")?;
+        let mut reader = Reader::from_str(&content);
+        reader.config_mut().trim_text(true);
+
+        let mut body = Vec::new();
+        let mut buf = Vec::new();
+
+        // Parsing context stacks
+        let mut in_body = false;
+        let mut para_stack: Vec<ParagraphCtx> = Vec::new();
+        let mut table_stack: Vec<TableCtx> = Vec::new();
+        let mut run_ctx: Option<RunCtx> = None;
+        let mut collecting_text = false;
+        let mut text_buf = String::new();
+        let mut comment_ranges: Vec<u32> = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    let tag = e.name();
+                    match tag.as_ref() {
+                        b"w:body" => in_body = true,
+
+                        b"w:p" if in_body || !table_stack.is_empty() => {
+                            para_stack.push(ParagraphCtx::new());
+                        }
+
+                        b"w:pPr" => {}
+
+                        b"w:pStyle" => {
+                            if let Some(ctx) = para_stack.last_mut() {
+                                ctx.style = get_attr(e, b"w:val");
+                            }
+                        }
+
+                        b"w:jc" => {
+                            if let Some(ctx) = para_stack.last_mut() {
+                                ctx.alignment = get_attr(e, b"w:val");
+                            }
+                        }
+
+                        b"w:r" => {
+                            if !para_stack.is_empty() {
+                                run_ctx = Some(RunCtx::new());
+                            }
+                        }
+
+                        b"w:rPr" => {}
+
+                        b"w:b" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.bold = !is_val_false(e);
+                            }
+                        }
+                        b"w:i" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.italic = !is_val_false(e);
+                            }
+                        }
+                        b"w:u" => {
+                            if let Some(ref mut r) = run_ctx {
+                                let val = get_attr(e, b"w:val");
+                                r.underline = val.as_deref() != Some("none");
+                            }
+                        }
+                        b"w:strike" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.strikethrough = !is_val_false(e);
+                            }
+                        }
+                        b"w:sz" => {
+                            if let Some(ref mut r) = run_ctx {
+                                if let Some(val) = get_attr(e, b"w:val") {
+                                    if let Ok(half_pt) = val.parse::<f32>() {
+                                        r.font_size = Some(half_pt / 2.0);
+                                    }
+                                }
+                            }
+                        }
+                        b"w:rFonts" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.font_family = get_attr(e, b"w:ascii")
+                                    .or_else(|| get_attr(e, b"w:hAnsi"));
+                            }
+                        }
+                        b"w:color" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.color = get_attr(e, b"w:val");
+                            }
+                        }
+                        b"w:highlight" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.highlight = get_attr(e, b"w:val");
+                            }
+                        }
+
+                        b"w:t" => {
+                            collecting_text = true;
+                            text_buf.clear();
+                        }
+
+                        b"w:tab" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.text.push('\t');
+                            }
+                        }
+
+                        b"w:br" => {
+                            let br_type = get_attr(e, b"w:type");
+                            if br_type.as_deref() == Some("page") {
+                                // Flush current paragraph context if any, then add page break
+                                if let Some(pctx) = para_stack.last_mut() {
+                                    // Add the run so far
+                                    if let Some(rctx) = run_ctx.take() {
+                                        pctx.runs.push(rctx.into_run(&comment_ranges));
+                                    }
+                                }
+                                // The page break will be emitted after the current paragraph ends
+                                if let Some(pctx) = para_stack.last_mut() {
+                                    pctx.has_page_break_after = true;
+                                }
+                            } else if let Some(ref mut r) = run_ctx {
+                                r.text.push('\n');
+                            }
+                        }
+
+                        // Comment range markers
+                        b"w:commentRangeStart" => {
+                            if let Some(id_str) = get_attr(e, b"w:id") {
+                                if let Ok(id) = id_str.parse::<u32>() {
+                                    comment_ranges.push(id);
+                                }
+                            }
+                        }
+                        b"w:commentRangeEnd" => {
+                            if let Some(id_str) = get_attr(e, b"w:id") {
+                                if let Ok(id) = id_str.parse::<u32>() {
+                                    if let Some(pos) =
+                                        comment_ranges.iter().position(|&cid| cid == id)
+                                    {
+                                        comment_ranges.remove(pos);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Footnote references
+                        b"w:footnoteReference" => {
+                            if let Some(ref mut r) = run_ctx {
+                                if let Some(id_str) = get_attr(e, b"w:id") {
+                                    r.footnote_ref = id_str.parse().ok();
+                                }
+                            }
+                        }
+
+                        // Image references via w:drawing -> ... -> a:blip
+                        b"a:blip" => {
+                            if let Some(ref mut r) = run_ctx {
+                                r.image_id = get_attr(e, b"r:embed");
+                            }
+                        }
+
+                        // Tables
+                        b"w:tbl" => {
+                            table_stack.push(TableCtx::new());
+                        }
+                        b"w:tr" => {
+                            if let Some(tctx) = table_stack.last_mut() {
+                                tctx.current_row = Some(Vec::new());
+                            }
+                        }
+                        b"w:tc" => {
+                            if table_stack
+                                .last()
+                                .and_then(|t| t.current_row.as_ref())
+                                .is_some()
+                            {
+                                // Push a new cell context -- paragraphs will go into it
+                            }
+                        }
+                        b"w:gridSpan" => {
+                            // Will be handled at tc level
+                        }
+                        b"w:vMerge" => {}
+                        b"w:shd" => {}
+
+                        _ => {}
+                    }
+                }
+
+                Ok(Event::Text(ref e)) => {
+                    if collecting_text {
+                        if let Ok(text) = e.unescape() {
+                            text_buf.push_str(&text);
+                        }
+                    }
+                }
+
+                Ok(Event::End(ref e)) => {
+                    match e.name().as_ref() {
+                        b"w:body" => in_body = false,
+
+                        b"w:t" => {
+                            collecting_text = false;
+                            if let Some(ref mut r) = run_ctx {
+                                r.text.push_str(&text_buf);
+                            }
+                        }
+
+                        b"w:r" => {
+                            if let Some(rctx) = run_ctx.take() {
+                                if let Some(pctx) = para_stack.last_mut() {
+                                    pctx.runs.push(rctx.into_run(&comment_ranges));
+                                }
+                            }
+                        }
+
+                        b"w:p" => {
+                            if let Some(pctx) = para_stack.pop() {
+                                let page_break = pctx.has_page_break_after;
+                                let element = pctx.into_block_element();
+
+                                if let Some(tctx) = table_stack.last_mut() {
+                                    tctx.push_cell_content(element);
+                                } else {
+                                    body.push(element);
+                                    if page_break {
+                                        body.push(BlockElement::PageBreak);
+                                    }
+                                }
+                            }
+                        }
+
+                        b"w:tc" => {
+                            if let Some(tctx) = table_stack.last_mut() {
+                                tctx.finish_cell();
+                            }
+                        }
+
+                        b"w:tr" => {
+                            if let Some(tctx) = table_stack.last_mut() {
+                                tctx.finish_row();
+                            }
+                        }
+
+                        b"w:tbl" => {
+                            if let Some(tctx) = table_stack.pop() {
+                                let table = BlockElement::Table { rows: tctx.rows };
+                                if let Some(parent_tctx) = table_stack.last_mut() {
+                                    parent_tctx.push_cell_content(table);
+                                } else {
+                                    body.push(table);
+                                }
+                            }
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(body)
+    }
+
+    // --- Styles ---
+
+    fn parse_styles(&mut self) -> Result<HashMap<String, Style>> {
+        let content = match self.read_archive_file("word/styles.xml") {
+            Ok(c) => c,
+            Err(_) => return Ok(HashMap::new()),
+        };
+
+        let mut styles = HashMap::new();
+        let mut reader = Reader::from_str(&content);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+
+        let mut current_style_id: Option<String> = None;
+        let mut current_style = Style::new();
+        let mut in_rpr = false;
+        let mut in_ppr = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    match e.name().as_ref() {
+                        b"w:style" => {
+                            current_style_id = get_attr(e, b"w:styleId");
+                            current_style = Style::new();
+                            // Check if it's a heading style
+                            if let Some(ref id) = current_style_id {
+                                if id.starts_with("Heading") || id.starts_with("heading") {
+                                    if let Some(level) = id.chars().last().and_then(|c| c.to_digit(10)) {
+                                        if level >= 1 && level <= 6 {
+                                            current_style.heading_level = Some(level as u8);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        b"w:name" => {
+                            if let Some(val) = get_attr(e, b"w:val") {
+                                let lower = val.to_lowercase();
+                                if lower.starts_with("heading ") {
+                                    if let Some(level) = lower.strip_prefix("heading ").and_then(|s| s.parse::<u8>().ok()) {
+                                        if level >= 1 && level <= 6 {
+                                            current_style.heading_level = Some(level);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        b"w:basedOn" => {
+                            current_style.based_on = get_attr(e, b"w:val");
+                        }
+                        b"w:rPr" => in_rpr = true,
+                        b"w:pPr" => in_ppr = true,
+                        b"w:jc" if in_ppr => {
+                            current_style.alignment = get_attr(e, b"w:val");
+                        }
+                        b"w:b" if in_rpr => {
+                            current_style.bold = Some(!is_val_false(e));
+                        }
+                        b"w:i" if in_rpr => {
+                            current_style.italic = Some(!is_val_false(e));
+                        }
+                        b"w:sz" if in_rpr => {
+                            if let Some(val) = get_attr(e, b"w:val") {
+                                if let Ok(half_pt) = val.parse::<f32>() {
+                                    current_style.font_size = Some(half_pt / 2.0);
+                                }
+                            }
+                        }
+                        b"w:rFonts" if in_rpr => {
+                            current_style.font_family = get_attr(e, b"w:ascii")
+                                .or_else(|| get_attr(e, b"w:hAnsi"));
+                        }
+                        b"w:color" if in_rpr => {
+                            current_style.color = get_attr(e, b"w:val");
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"w:style" => {
+                        if let Some(id) = current_style_id.take() {
+                            styles.insert(id, current_style.clone());
+                        }
+                        current_style = Style::new();
+                        in_rpr = false;
+                        in_ppr = false;
+                    }
+                    b"w:rPr" => in_rpr = false,
+                    b"w:pPr" => in_ppr = false,
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        // Resolve style inheritance
+        let style_ids: Vec<String> = styles.keys().cloned().collect();
+        for id in &style_ids {
+            let mut resolved = styles.get(id).cloned().unwrap_or_default();
+            let mut visited = vec![id.clone()];
+            let mut base_id = resolved.based_on.clone();
+            while let Some(ref bid) = base_id {
+                if visited.contains(bid) {
+                    break; // cycle
+                }
+                visited.push(bid.clone());
+                if let Some(base) = styles.get(bid) {
+                    if resolved.font_size.is_none() {
+                        resolved.font_size = base.font_size;
+                    }
+                    if resolved.font_family.is_none() {
+                        resolved.font_family = base.font_family.clone();
+                    }
+                    if resolved.bold.is_none() {
+                        resolved.bold = base.bold;
+                    }
+                    if resolved.italic.is_none() {
+                        resolved.italic = base.italic;
+                    }
+                    if resolved.color.is_none() {
+                        resolved.color = base.color.clone();
+                    }
+                    if resolved.alignment.is_none() {
+                        resolved.alignment = base.alignment.clone();
+                    }
+                    if resolved.heading_level.is_none() {
+                        resolved.heading_level = base.heading_level;
+                    }
+                    base_id = base.based_on.clone();
+                } else {
+                    break;
+                }
+            }
+            styles.insert(id.clone(), resolved);
+        }
+
+        Ok(styles)
+    }
+
+    // --- Comments ---
+
+    fn parse_comments(&mut self) -> Result<Vec<Comment>> {
+        let content = match self.read_archive_file("word/comments.xml") {
+            Ok(c) => c,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut comments = Vec::new();
+        let mut reader = Reader::from_str(&content);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+
+        let mut current: Option<Comment> = None;
+        let mut text_buf = String::new();
+        let mut in_text = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                    b"w:comment" => {
+                        let id = get_attr(e, b"w:id")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let author = get_attr(e, b"w:author").unwrap_or_default();
+                        let date = get_attr(e, b"w:date");
+                        current = Some(Comment {
+                            id,
+                            author,
+                            date,
+                            text: String::new(),
+                        });
+                        text_buf.clear();
+                    }
+                    b"w:t" if current.is_some() => {
+                        in_text = true;
+                    }
+                    _ => {}
+                },
+                Ok(Event::Text(ref e)) if in_text => {
+                    if let Ok(t) = e.unescape() {
+                        text_buf.push_str(&t);
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"w:t" => in_text = false,
+                    b"w:p" if current.is_some() => {
+                        if !text_buf.is_empty() {
+                            if let Some(ref mut c) = current {
+                                if !c.text.is_empty() {
+                                    c.text.push('\n');
+                                }
+                                c.text.push_str(&text_buf);
+                            }
+                            text_buf.clear();
+                        }
+                    }
+                    b"w:comment" => {
+                        if let Some(comment) = current.take() {
+                            comments.push(comment);
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(comments)
+    }
+
+    // --- Images ---
+
+    fn parse_images(&mut self) -> Result<HashMap<String, String>> {
+        let mut images = HashMap::new();
+
+        for rel in &self.relationships.clone() {
+            if !rel.rel_type.contains("image") && !rel.target.starts_with("media/") {
+                continue;
+            }
+
+            let full_path = if rel.target.starts_with("media/") {
+                format!("word/{}", rel.target)
+            } else if rel.target.starts_with("word/") {
+                rel.target.clone()
+            } else {
+                format!("word/{}", rel.target)
+            };
+
+            let lower = full_path.to_lowercase();
+            if lower.ends_with(".emf") || lower.ends_with(".wmf") {
+                images.insert(rel.id.clone(), self.placeholder_data_uri(&full_path));
+                continue;
+            }
+
+            match self.archive.by_name(&full_path) {
+                Ok(mut file) => {
+                    let mut buffer = Vec::new();
+                    if file.read_to_end(&mut buffer).is_ok() {
+                        let mime = mime_for_path(&full_path);
+                        let b64 =
+                            base64::engine::general_purpose::STANDARD.encode(&buffer);
+                        images.insert(rel.id.clone(), format!("data:{};base64,{}", mime, b64));
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(images)
+    }
+
+    // --- Headers & Footers ---
+
+    fn parse_headers_footers(&mut self) -> Result<(Vec<HeaderFooter>, Vec<HeaderFooter>)> {
+        let mut headers = Vec::new();
+        let mut footers = Vec::new();
+
+        // Find header/footer relationships
+        for rel in &self.relationships.clone() {
+            let is_header = rel.rel_type.contains("header");
+            let is_footer = rel.rel_type.contains("footer");
+            if !is_header && !is_footer {
+                continue;
+            }
+
+            let path = if rel.target.starts_with("word/") {
+                rel.target.clone()
+            } else {
+                format!("word/{}", rel.target)
+            };
+
+            if let Ok(content) = self.read_archive_file(&path) {
+                let blocks = self.parse_body_xml(&content);
+                let section = extract_section_number(&rel.target);
+                let hf = HeaderFooter {
+                    content: blocks,
+                    section,
+                };
+                if is_header {
+                    headers.push(hf);
+                } else {
+                    footers.push(hf);
+                }
+            }
+        }
+
+        Ok((headers, footers))
+    }
+
+    // --- Footnotes ---
+
+    fn parse_footnotes(&mut self) -> Result<Vec<Footnote>> {
+        let content = match self.read_archive_file("word/footnotes.xml") {
+            Ok(c) => c,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut footnotes = Vec::new();
+        let mut reader = Reader::from_str(&content);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+
+        let mut current_id: Option<u32> = None;
+        let mut current_blocks: Vec<BlockElement> = Vec::new();
+        let mut para_runs: Vec<Run> = Vec::new();
+        let mut run_text = String::new();
+        let mut in_run = false;
+        let mut in_text = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                    b"w:footnote" => {
+                        current_id = get_attr(e, b"w:id").and_then(|s| s.parse().ok());
+                        current_blocks.clear();
+                    }
+                    b"w:r" if current_id.is_some() => {
+                        in_run = true;
+                        run_text.clear();
+                    }
+                    b"w:t" if in_run => {
+                        in_text = true;
+                    }
+                    _ => {}
+                },
+                Ok(Event::Text(ref e)) if in_text => {
+                    if let Ok(t) = e.unescape() {
+                        run_text.push_str(&t);
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"w:t" => in_text = false,
+                    b"w:r" => {
+                        in_run = false;
+                        if !run_text.is_empty() {
+                            para_runs.push(Run::new(run_text.clone()));
+                        }
+                        run_text.clear();
+                    }
+                    b"w:p" if current_id.is_some() => {
+                        if !para_runs.is_empty() {
+                            current_blocks.push(BlockElement::Paragraph {
+                                runs: std::mem::take(&mut para_runs),
+                                style: None,
+                                alignment: None,
+                            });
+                        }
+                    }
+                    b"w:footnote" => {
+                        if let Some(id) = current_id.take() {
+                            // Skip special footnotes (separator, continuation)
+                            if id > 0 {
+                                footnotes.push(Footnote {
+                                    id,
+                                    content: std::mem::take(&mut current_blocks),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(footnotes)
+    }
+
+    // --- Relationships ---
+
+    fn read_relationships(&mut self) -> Vec<Relationship> {
+        let content = match self.read_archive_file("word/_rels/document.xml.rels") {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut rels = Vec::new();
+        let mut reader = Reader::from_str(&content);
+        let mut buf = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    if e.name().as_ref() == b"Relationship" {
+                        let id = get_attr(e, b"Id").unwrap_or_default();
+                        let rel_type = get_attr(e, b"Type").unwrap_or_default();
+                        let target = get_attr(e, b"Target").unwrap_or_default();
+                        if !id.is_empty() {
+                            rels.push(Relationship {
+                                id,
+                                rel_type,
+                                target,
+                            });
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        rels
+    }
+
+    // --- Helpers ---
+
+    fn read_archive_file(&mut self, path: &str) -> Result<String> {
+        match self.archive.by_name(path) {
+            Ok(mut file) => {
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                Ok(content)
+            }
+            Err(e) => Err(ParseError::Zip(e)),
+        }
+    }
+
+    /// Parse a body-like XML fragment (for headers/footers) into BlockElements
+    fn parse_body_xml(&self, content: &str) -> Vec<BlockElement> {
+        let mut blocks = Vec::new();
+        let mut reader = Reader::from_str(content);
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+
+        let mut runs: Vec<Run> = Vec::new();
+        let mut run_text = String::new();
+        let mut in_run = false;
+        let mut in_text = false;
+        let mut para_style: Option<String> = None;
+        let mut para_alignment: Option<String> = None;
+        let mut in_para = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                    b"w:p" => {
+                        in_para = true;
+                        para_style = None;
+                        para_alignment = None;
+                    }
+                    b"w:pStyle" if in_para => {
+                        para_style = get_attr(e, b"w:val");
+                    }
+                    b"w:jc" if in_para => {
+                        para_alignment = get_attr(e, b"w:val");
+                    }
+                    b"w:r" if in_para => {
+                        in_run = true;
+                        run_text.clear();
+                    }
+                    b"w:t" if in_run => in_text = true,
+                    _ => {}
+                },
+                Ok(Event::Text(ref e)) if in_text => {
+                    if let Ok(t) = e.unescape() {
+                        run_text.push_str(&t);
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"w:t" => in_text = false,
+                    b"w:r" => {
+                        in_run = false;
+                        if !run_text.is_empty() {
+                            runs.push(Run::new(run_text.clone()));
+                        }
+                        run_text.clear();
+                    }
+                    b"w:p" => {
+                        in_para = false;
+                        blocks.push(BlockElement::Paragraph {
+                            runs: std::mem::take(&mut runs),
+                            style: para_style.take(),
+                            alignment: para_alignment.take(),
+                        });
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        blocks
+    }
+
+    fn placeholder_data_uri(&self, path: &str) -> String {
+        let filename = path.split('/').last().unwrap_or(path);
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='80'>\
+             <rect width='200' height='80' fill='#f0f0f0' stroke='#ccc'/>\
+             <text x='100' y='35' text-anchor='middle' font-size='11' fill='#666'>Unsupported format</text>\
+             <text x='100' y='55' text-anchor='middle' font-size='9' fill='#999'>{}</text>\
+             </svg>",
+            filename
+        );
+        let b64 = base64::engine::general_purpose::STANDARD.encode(svg.as_bytes());
+        format!("data:image/svg+xml;base64,{}", b64)
+    }
+
+    pub fn get_image_mime_type(&self, filename: &str) -> &'static str {
+        mime_for_path(filename)
+    }
+
+    pub fn is_supported_image(&self, filename: &str) -> bool {
+        let lower = filename.to_lowercase();
+        lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".gif")
+            || lower.ends_with(".bmp")
+    }
+}
+
+// --- Internal context types ---
+
+struct ParagraphCtx {
+    runs: Vec<Run>,
+    style: Option<String>,
+    alignment: Option<String>,
+    has_page_break_after: bool,
+}
+
+impl ParagraphCtx {
+    fn new() -> Self {
+        Self {
+            runs: Vec::new(),
+            style: None,
+            alignment: None,
+            has_page_break_after: false,
+        }
+    }
+
+    fn into_block_element(self) -> BlockElement {
+        BlockElement::Paragraph {
+            runs: self.runs,
+            style: self.style,
+            alignment: self.alignment,
+        }
+    }
+}
+
+struct RunCtx {
+    text: String,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    font_size: Option<f32>,
+    font_family: Option<String>,
+    color: Option<String>,
+    highlight: Option<String>,
+    footnote_ref: Option<u32>,
+    image_id: Option<String>,
+}
+
+impl RunCtx {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            font_size: None,
+            font_family: None,
+            color: None,
+            highlight: None,
+            footnote_ref: None,
+            image_id: None,
+        }
+    }
+
+    fn into_run(self, comment_ranges: &[u32]) -> Run {
+        Run {
+            text: self.text,
+            bold: self.bold,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            font_size: self.font_size,
+            font_family: self.font_family,
+            color: self.color,
+            highlight: self.highlight,
+            comment_ref: comment_ranges.last().copied(),
+            footnote_ref: self.footnote_ref,
+            image_id: self.image_id,
+        }
+    }
+}
+
+struct TableCtx {
+    rows: Vec<TableRow>,
+    current_row: Option<Vec<TableCell>>,
+    cell_content: Vec<BlockElement>,
+}
+
+impl TableCtx {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            current_row: None,
+            cell_content: Vec::new(),
+        }
+    }
+
+    fn push_cell_content(&mut self, element: BlockElement) {
+        self.cell_content.push(element);
+    }
+
+    fn finish_cell(&mut self) {
+        if let Some(ref mut row) = self.current_row {
+            row.push(TableCell::new(std::mem::take(&mut self.cell_content)));
+        }
+    }
+
+    fn finish_row(&mut self) {
+        if let Some(cells) = self.current_row.take() {
+            self.rows.push(TableRow { cells });
+        }
+    }
+}
+
+// --- Free functions ---
+
+fn get_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == key {
+            return std::str::from_utf8(&attr.value).ok().map(String::from);
+        }
+    }
+    None
+}
+
+fn is_val_false(e: &BytesStart) -> bool {
+    match get_attr(e, b"w:val") {
+        Some(v) => v == "0" || v == "false",
+        None => false, // absence means true for boolean properties
+    }
+}
+
+fn mime_for_path(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn extract_section_number(path: &str) -> u32 {
+    // Extract number from "header1.xml", "footer2.xml", etc.
+    let filename = path.split('/').last().unwrap_or(path);
+    filename
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mime_types() {
+        assert_eq!(mime_for_path("test.png"), "image/png");
+        assert_eq!(mime_for_path("test.jpg"), "image/jpeg");
+        assert_eq!(mime_for_path("test.jpeg"), "image/jpeg");
+        assert_eq!(mime_for_path("test.gif"), "image/gif");
+        assert_eq!(mime_for_path("test.bmp"), "image/bmp");
+    }
+
+    #[test]
+    fn test_get_attr() {
+        let xml = r#"<w:pStyle w:val="Heading1"/>"#;
+        let mut reader = Reader::from_str(xml);
+        let mut buf = Vec::new();
+        if let Ok(Event::Empty(ref e)) = reader.read_event_into(&mut buf) {
+            assert_eq!(get_attr(e, b"w:val"), Some("Heading1".to_string()));
+            assert_eq!(get_attr(e, b"w:missing"), None);
+        }
+    }
+
+    #[test]
+    fn test_extract_section_number() {
+        assert_eq!(extract_section_number("header1.xml"), 1);
+        assert_eq!(extract_section_number("word/footer2.xml"), 2);
+        assert_eq!(extract_section_number("header.xml"), 1); // fallback
+    }
+}

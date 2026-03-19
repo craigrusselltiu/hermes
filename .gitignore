@@ -2,3 +2,16 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Beads local state
+.beads/.beads-credential-key
+.beads/obelisk.port
+.beads/obelisk_sessions.jsonl
+.beads/logs/
+
+# Obelisk
+.obelisk/
