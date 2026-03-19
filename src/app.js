@@ -521,26 +521,53 @@ function renderRun(run, container, doc) {
         container.appendChild(sup);
     }
 
-    // Text run
     if (!run.text || run.text.length === 0) return;
 
-    const hasTabs = run.text.includes('\t');
     const hasFormatting = run.bold || run.italic || run.underline || run.strikethrough ||
         run.font_size || run.color || run.highlight || run.comment_ref != null;
 
-    // Bare text node when no formatting, tabs, or links
-    if (!hasFormatting && !hasTabs && !run.link_url) {
+    // Plain text node shortcut
+    if (!hasFormatting && !run.text.includes('\t') && !run.link_url) {
         container.appendChild(document.createTextNode(run.text));
         return;
     }
 
-    const span = document.createElement('span');
-    span.textContent = run.text;
-    if (hasTabs) {
-        span.style.whiteSpace = 'pre-wrap';
-        span.style.tabSize = '4';
+    // Determine output target (link wrapper or direct container)
+    let target = container;
+    if (run.link_url) {
+        const a = document.createElement('a');
+        a.href = run.link_url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.className = 'doc-link';
+        target = a;
     }
 
+    // Render text, splitting on tabs into explicit tab-stop elements
+    if (run.text.includes('\t')) {
+        const parts = run.text.split('\t');
+        for (let i = 0; i < parts.length; i++) {
+            if (parts[i]) {
+                target.appendChild(hasFormatting ? styledSpan(parts[i], run) : document.createTextNode(parts[i]));
+            }
+            if (i < parts.length - 1) {
+                const tab = document.createElement('span');
+                tab.className = 'doc-tab';
+                target.appendChild(tab);
+            }
+        }
+    } else {
+        target.appendChild(styledSpan(run.text, run));
+    }
+
+    if (target !== container) {
+        container.appendChild(target);
+    }
+}
+
+function styledSpan(text, run) {
+    const span = document.createElement('span');
+    span.textContent = text;
     if (run.bold) span.style.fontWeight = 'bold';
     if (run.italic) span.style.fontStyle = 'italic';
     if (run.underline) span.style.textDecoration = 'underline';
@@ -553,24 +580,11 @@ function renderRun(run, container, doc) {
     if (run.highlight) {
         span.style.backgroundColor = highlightColorMap[run.highlight] || run.highlight;
     }
-
     if (run.comment_ref != null) {
         span.classList.add('commented-text');
         span.dataset.commentId = run.comment_ref;
     }
-
-    // Wrap in link if hyperlink
-    if (run.link_url) {
-        const a = document.createElement('a');
-        a.href = run.link_url;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.className = 'doc-link';
-        a.appendChild(span);
-        container.appendChild(a);
-    } else {
-        container.appendChild(span);
-    }
+    return span;
 }
 
 function renderTable(table, doc) {

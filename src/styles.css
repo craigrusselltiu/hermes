@@ -323,6 +323,11 @@ body {
 .page-content h5 { font-size: 0.83em; margin: 0.5em 0; }
 .page-content h6 { font-size: 0.67em; margin: 0.5em 0; }
 
+.doc-tab {
+    display: inline-block;
+    width: 2em;
+}
+
 .doc-image {
     max-width: 100%;
     height: auto;
