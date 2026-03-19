@@ -10,6 +10,13 @@ This repository currently documents installation from source. You will need:
 - Tauri prerequisites for your platform
 - on Windows, Microsoft Edge WebView2
 
+### `tauri-cli` vs. the Desktop App
+
+- `tauri-cli` is a developer tool. You install it so commands like `cargo tauri build` and `cargo tauri dev` work.
+- The Hermes desktop app is the actual program you run to open `.docx` files.
+- If you are building Hermes from source, you need `tauri-cli`.
+- If you are just installing a prebuilt Hermes release, you would run the app directly and would not need `tauri-cli`.
+
 If you do not already have the Tauri CLI installed:
 
 ```bash
