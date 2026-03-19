@@ -280,6 +280,9 @@ function renderDocument(doc) {
     commentsPanel.style.display = 'none';
     closeFindBar();
 
+    // Cache resolved default style once for entire render pass
+    doc._defaultStyle = computeDefaultStyle(doc);
+
     const pages = splitIntoPages(doc.body);
     const fragment = document.createDocumentFragment();
 
@@ -469,42 +472,19 @@ function applyParagraphStyle(el, para, style) {
 }
 
 function resolveParagraphStyle(para, doc) {
-    return resolveStyle(para?.style, doc) || getDefaultDocumentStyle(doc);
+    // Styles are already inheritance-resolved in Rust, so direct lookup is sufficient
+    if (para?.style && doc?.styles) {
+        return doc.styles[para.style] || doc._defaultStyle || null;
+    }
+    return doc._defaultStyle || null;
 }
 
-function resolveStyle(styleId, doc, seen = new Set()) {
-    if (!styleId || !doc?.styles || seen.has(styleId)) {
-        return null;
-    }
-
-    const style = doc.styles[styleId];
-    if (!style) {
-        return null;
-    }
-
-    seen.add(styleId);
-
-    const parentStyle = style.based_on
-        ? resolveStyle(style.based_on, doc, seen)
-        : null;
-
-    return parentStyle
-        ? { ...parentStyle, ...style, based_on: style.based_on }
-        : style;
-}
-
-function getDefaultDocumentStyle(doc) {
+function computeDefaultStyle(doc) {
     if (!doc?.styles) return null;
-
-    return resolveStyle('Normal', doc)
-        || resolveStyle('normal', doc)
-        || findStyleByName(doc.styles, 'normal');
-}
-
-function findStyleByName(styles, styleName) {
-    const target = String(styleName).toLowerCase();
-    const styleId = Object.keys(styles).find((key) => key.toLowerCase() === target);
-    return styleId ? resolveStyle(styleId, { styles }) : null;
+    if (doc.styles['Normal']) return doc.styles['Normal'];
+    if (doc.styles['normal']) return doc.styles['normal'];
+    const key = Object.keys(doc.styles).find(k => k.toLowerCase() === 'normal');
+    return key ? doc.styles[key] : null;
 }
 
 function renderRun(run, container, doc) {
@@ -532,10 +512,16 @@ function renderRun(run, container, doc) {
     // Text run
     if (!run.text || run.text.length === 0) return;
 
+    // Use bare text node when no formatting is needed (majority of runs)
+    if (!run.bold && !run.italic && !run.underline && !run.strikethrough &&
+        !run.font_size && !run.color && !run.highlight && run.comment_ref == null) {
+        container.appendChild(document.createTextNode(run.text));
+        return;
+    }
+
     const span = document.createElement('span');
     span.textContent = run.text;
 
-    // Apply formatting
     if (run.bold) span.style.fontWeight = 'bold';
     if (run.italic) span.style.fontStyle = 'italic';
     if (run.underline) span.style.textDecoration = 'underline';
@@ -549,7 +535,6 @@ function renderRun(run, container, doc) {
         span.style.backgroundColor = highlightColorMap[run.highlight] || run.highlight;
     }
 
-    // Comment reference
     if (run.comment_ref != null) {
         span.classList.add('commented-text');
         span.dataset.commentId = run.comment_ref;
@@ -610,11 +595,11 @@ function collectFootnotes(blocks, footnotes) {
 function detectHeadingLevel(styleName) {
     if (!styleName) return 0;
     const lower = styleName.toLowerCase();
-    const match = lower.match(/heading\s*(\d)/);
-    if (match) return parseInt(match[1]);
     if (lower === 'title') return 1;
     if (lower === 'subtitle') return 2;
-    return 0;
+    if (!lower.startsWith('heading')) return 0;
+    const ch = lower.charAt(lower.length - 1);
+    return (ch >= '1' && ch <= '6') ? (ch.charCodeAt(0) - 48) : 0;
 }
 
 const highlightColorMap = {
@@ -907,9 +892,12 @@ function getThemeIconSvg(theme) {
 // --- Utilities ---
 
 function escapeHtml(text) {
-    const d = document.createElement('div');
-    d.textContent = text;
-    return d.innerHTML;
+    if (!text) return '';
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
 }
 
 function formatDate(dateStr) {

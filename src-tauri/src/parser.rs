@@ -756,7 +756,7 @@ impl DocxParser {
             }
 
             if let Ok(mut file) = self.archive.by_name(&full_path) {
-                let mut buffer = Vec::new();
+                let mut buffer = Vec::with_capacity(file.size() as usize);
                 if file.read_to_end(&mut buffer).is_ok() {
                     let mime = mime_for_path(&full_path);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&buffer);
@@ -936,7 +936,7 @@ impl DocxParser {
     fn read_archive_file(&mut self, path: &str) -> Result<String> {
         match self.archive.by_name(path) {
             Ok(mut file) => {
-                let mut content = String::new();
+                let mut content = String::with_capacity(file.size() as usize);
                 file.read_to_string(&mut content)?;
                 Ok(content)
             }

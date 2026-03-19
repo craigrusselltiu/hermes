@@ -1,15 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// The main document model that represents a parsed DOCX file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub body: Vec<BlockElement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HeaderFooter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub footers: Vec<HeaderFooter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub footnotes: Vec<Footnote>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub styles: HashMap<String, Style>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub images: HashMap<String, String>, // rId -> base64 data URI
 }
 
@@ -20,7 +30,9 @@ pub enum BlockElement {
     #[serde(rename = "paragraph")]
     Paragraph {
         runs: Vec<Run>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         alignment: Option<String>,
     },
     #[serde(rename = "table")]
@@ -33,16 +45,27 @@ pub enum BlockElement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub strikethrough: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,        // in pt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,         // hex
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_ref: Option<u32>,      // links to Comment.id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footnote_ref: Option<u32>,     // links to Footnote.id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_id: Option<String>,      // links to images map
 }
 
@@ -58,6 +81,7 @@ pub struct TableCell {
     pub content: Vec<BlockElement>,
     pub col_span: u32,
     pub row_span: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shading: Option<String>, // background color hex
 }
 
@@ -66,10 +90,14 @@ pub struct TableCell {
 pub struct Comment {
     pub id: u32,
     pub author: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub para_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<u32>,
 }
 
@@ -90,13 +118,21 @@ pub struct Footnote {
 /// Style definition with inheritance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Style {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub based_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading_level: Option<u8>, // 1-6 for heading styles
 }
 
