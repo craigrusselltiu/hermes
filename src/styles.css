@@ -330,6 +330,20 @@ body {
     margin: 0.5em 0;
 }
 
+.doc-link {
+    color: var(--link-color);
+    text-decoration: underline;
+    cursor: pointer;
+}
+.doc-link:hover { opacity: 0.8; }
+
+.doc-list-item {
+    display: list-item;
+    padding-left: 1.5em;
+}
+.doc-list-bullet { list-style-type: disc; }
+.doc-list-ordered { list-style-type: decimal; }
+
 .doc-table {
     border-collapse: collapse;
     width: 100%;

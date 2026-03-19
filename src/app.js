@@ -432,6 +432,17 @@ function renderParagraph(para, doc) {
 
     applyParagraphStyle(el, para, style);
 
+    // List item handling
+    if (para.list_level != null) {
+        el.classList.add('doc-list-item');
+        el.style.marginLeft = (para.list_level * 1.5) + 'em';
+        if (para.list_format === 'bullet') {
+            el.classList.add('doc-list-bullet');
+        } else if (para.list_format) {
+            el.classList.add('doc-list-ordered');
+        }
+    }
+
     const fragment = document.createDocumentFragment();
     if (para.runs) {
         for (const run of para.runs) {
@@ -439,7 +450,7 @@ function renderParagraph(para, doc) {
         }
     }
 
-    if (fragment.childNodes.length === 0) {
+    if (fragment.childNodes.length === 0 && para.list_level == null) {
         el.innerHTML = '&nbsp;';
     } else {
         el.appendChild(fragment);
@@ -512,15 +523,19 @@ function renderRun(run, container, doc) {
     // Text run
     if (!run.text || run.text.length === 0) return;
 
-    // Use bare text node when no formatting is needed (majority of runs)
-    if (!run.bold && !run.italic && !run.underline && !run.strikethrough &&
-        !run.font_size && !run.color && !run.highlight && run.comment_ref == null) {
+    const hasTabs = run.text.includes('\t');
+    const hasFormatting = run.bold || run.italic || run.underline || run.strikethrough ||
+        run.font_size || run.color || run.highlight || run.comment_ref != null;
+
+    // Bare text node when no formatting, tabs, or links
+    if (!hasFormatting && !hasTabs && !run.link_url) {
         container.appendChild(document.createTextNode(run.text));
         return;
     }
 
     const span = document.createElement('span');
     span.textContent = run.text;
+    if (hasTabs) span.style.whiteSpace = 'pre';
 
     if (run.bold) span.style.fontWeight = 'bold';
     if (run.italic) span.style.fontStyle = 'italic';
@@ -540,7 +555,18 @@ function renderRun(run, container, doc) {
         span.dataset.commentId = run.comment_ref;
     }
 
-    container.appendChild(span);
+    // Wrap in link if hyperlink
+    if (run.link_url) {
+        const a = document.createElement('a');
+        a.href = run.link_url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.className = 'doc-link';
+        a.appendChild(span);
+        container.appendChild(a);
+    } else {
+        container.appendChild(span);
+    }
 }
 
 function renderTable(table, doc) {

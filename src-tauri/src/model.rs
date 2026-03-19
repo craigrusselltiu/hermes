@@ -34,6 +34,10 @@ pub enum BlockElement {
         style: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alignment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_level: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_format: Option<String>,
     },
     #[serde(rename = "table")]
     Table { rows: Vec<TableRow> },
@@ -67,6 +71,8 @@ pub struct Run {
     pub footnote_ref: Option<u32>,     // links to Footnote.id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_id: Option<String>,      // links to images map
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_url: Option<String>,      // hyperlink URL
 }
 
 /// A row in a table
@@ -173,6 +179,7 @@ impl Run {
             comment_ref: None,
             footnote_ref: None,
             image_id: None,
+            link_url: None,
         }
     }
 
@@ -196,6 +203,7 @@ impl Run {
             comment_ref: None,
             footnote_ref: None,
             image_id: None,
+            link_url: None,
         }
     }
 }

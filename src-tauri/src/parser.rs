@@ -52,10 +52,18 @@ impl From<quick_xml::Error> for ParseError {
 
 pub type Result<T> = std::result::Result<T, ParseError>;
 
+#[derive(Clone)]
+struct NumberingLevelInfo {
+    num_fmt: String,
+    lvl_text: String,
+    start: u32,
+}
+
 pub struct DocxParser {
     archive: ZipArchive<File>,
     relationships: Vec<Relationship>,
     referenced_image_ids: HashSet<String>,
+    numbering_levels: HashMap<(u32, u8), NumberingLevelInfo>,
 }
 
 impl DocxParser {
@@ -75,6 +83,7 @@ impl DocxParser {
             archive,
             relationships: Vec::new(),
             referenced_image_ids: HashSet::new(),
+            numbering_levels: HashMap::new(),
         };
 
         // Validate required files
@@ -84,8 +93,9 @@ impl DocxParser {
             ));
         }
 
-        // Pre-parse relationships
+        // Pre-parse relationships and numbering
         parser.relationships = parser.read_relationships();
+        parser.numbering_levels = parser.parse_numbering();
 
         Ok(parser)
     }
@@ -124,6 +134,9 @@ impl DocxParser {
         let mut collecting_text = false;
         let mut text_buf = String::new();
         let mut comment_ranges: Vec<u32> = Vec::new();
+        let mut hyperlink_url: Option<String> = None;
+        let mut in_num_pr = false;
+        let mut list_counters: HashMap<(u32, u8), u32> = HashMap::new();
 
         loop {
             match reader.read_event_into(&mut buf) {
@@ -150,9 +163,31 @@ impl DocxParser {
                             }
                         }
 
+                        b"w:hyperlink" => {
+                            hyperlink_url = get_attr(e, b"r:id").and_then(|id| {
+                                self.relationships.iter()
+                                    .find(|r| r.id == id)
+                                    .map(|r| r.target.clone())
+                            });
+                        }
+
+                        b"w:numPr" => { in_num_pr = true; }
+                        b"w:ilvl" if in_num_pr => {
+                            if let Some(ctx) = para_stack.last_mut() {
+                                ctx.ilvl = get_attr(e, b"w:val").and_then(|v| v.parse().ok());
+                            }
+                        }
+                        b"w:numId" if in_num_pr => {
+                            if let Some(ctx) = para_stack.last_mut() {
+                                ctx.num_id = get_attr(e, b"w:val").and_then(|v| v.parse().ok());
+                            }
+                        }
+
                         b"w:r" => {
                             if !para_stack.is_empty() {
-                                run_ctx = Some(RunCtx::new());
+                                let mut rctx = RunCtx::new();
+                                rctx.link_url = hyperlink_url.clone();
+                                run_ctx = Some(rctx);
                             }
                         }
 
@@ -336,10 +371,33 @@ impl DocxParser {
                             }
                         }
 
+                        b"w:hyperlink" => { hyperlink_url = None; }
+                        b"w:numPr" => { in_num_pr = false; }
+
                         b"w:p" => {
                             if let Some(pctx) = para_stack.pop() {
                                 let page_break = pctx.has_page_break_after;
-                                let element = pctx.into_block_element();
+
+                                // Compute list info
+                                let (list_level, list_format) = match (pctx.num_id, pctx.ilvl) {
+                                    (Some(num_id), Some(ilvl)) if num_id > 0 => {
+                                        if let Some(info) = self.numbering_levels.get(&(num_id, ilvl)) {
+                                            let counter = list_counters
+                                                .entry((num_id, ilvl))
+                                                .or_insert(info.start.saturating_sub(1));
+                                            *counter += 1;
+                                            for higher in (ilvl + 1)..=8 {
+                                                list_counters.remove(&(num_id, higher));
+                                            }
+                                            (Some(ilvl), Some(info.num_fmt.clone()))
+                                        } else {
+                                            (Some(ilvl), Some("bullet".to_string()))
+                                        }
+                                    }
+                                    _ => (None, None),
+                                };
+
+                                let element = pctx.into_block_element(list_level, list_format);
 
                                 if let Some(tctx) = table_stack.last_mut() {
                                     tctx.push_cell_content(element);
@@ -867,6 +925,8 @@ impl DocxParser {
                                 runs: std::mem::take(&mut para_runs),
                                 style: None,
                                 alignment: None,
+                                list_level: None,
+                                list_format: None,
                             });
                         }
                     }
@@ -891,6 +951,113 @@ impl DocxParser {
         }
 
         Ok(footnotes)
+    }
+
+    // --- Numbering ---
+
+    fn parse_numbering(&mut self) -> HashMap<(u32, u8), NumberingLevelInfo> {
+        let content = match self.read_archive_file("word/numbering.xml") {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        let mut reader = Reader::from_str(&content);
+        let mut buf = Vec::new();
+
+        let mut abstract_nums: HashMap<u32, Vec<(u8, NumberingLevelInfo)>> = HashMap::new();
+        let mut num_to_abstract: HashMap<u32, u32> = HashMap::new();
+
+        let mut cur_abstract_id: Option<u32> = None;
+        let mut cur_lvl_ilvl: Option<u8> = None;
+        let mut lvl_num_fmt = String::new();
+        let mut lvl_text = String::new();
+        let mut lvl_start: u32 = 1;
+        let mut in_num = false;
+        let mut cur_num_id: Option<u32> = None;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    match e.name().as_ref() {
+                        b"w:abstractNum" => {
+                            cur_abstract_id =
+                                get_attr(e, b"w:abstractNumId").and_then(|v| v.parse().ok());
+                        }
+                        b"w:lvl" if cur_abstract_id.is_some() => {
+                            cur_lvl_ilvl = get_attr(e, b"w:ilvl").and_then(|v| v.parse().ok());
+                            lvl_num_fmt.clear();
+                            lvl_text.clear();
+                            lvl_start = 1;
+                        }
+                        b"w:start" if cur_lvl_ilvl.is_some() => {
+                            if let Some(v) = get_attr(e, b"w:val") {
+                                lvl_start = v.parse().unwrap_or(1);
+                            }
+                        }
+                        b"w:numFmt" if cur_lvl_ilvl.is_some() => {
+                            if let Some(v) = get_attr(e, b"w:val") {
+                                lvl_num_fmt = v;
+                            }
+                        }
+                        b"w:lvlText" if cur_lvl_ilvl.is_some() => {
+                            if let Some(v) = get_attr(e, b"w:val") {
+                                lvl_text = v;
+                            }
+                        }
+                        b"w:num" => {
+                            in_num = true;
+                            cur_num_id = get_attr(e, b"w:numId").and_then(|v| v.parse().ok());
+                        }
+                        b"w:abstractNumId" if in_num => {
+                            if let (Some(num_id), Some(abs_id)) = (
+                                cur_num_id,
+                                get_attr(e, b"w:val").and_then(|v| v.parse().ok()),
+                            ) {
+                                num_to_abstract.insert(num_id, abs_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"w:lvl" => {
+                        if let (Some(abs_id), Some(ilvl)) = (cur_abstract_id, cur_lvl_ilvl.take())
+                        {
+                            abstract_nums.entry(abs_id).or_default().push((
+                                ilvl,
+                                NumberingLevelInfo {
+                                    num_fmt: lvl_num_fmt.clone(),
+                                    lvl_text: lvl_text.clone(),
+                                    start: lvl_start,
+                                },
+                            ));
+                        }
+                    }
+                    b"w:abstractNum" => {
+                        cur_abstract_id = None;
+                    }
+                    b"w:num" => {
+                        in_num = false;
+                        cur_num_id = None;
+                    }
+                    _ => {}
+                },
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        let mut result = HashMap::new();
+        for (&num_id, &abs_id) in &num_to_abstract {
+            if let Some(levels) = abstract_nums.get(&abs_id) {
+                for (ilvl, info) in levels {
+                    result.insert((num_id, *ilvl), info.clone());
+                }
+            }
+        }
+        result
     }
 
     // --- Relationships ---
@@ -957,6 +1124,7 @@ impl DocxParser {
         let mut para_style: Option<String> = None;
         let mut para_alignment: Option<String> = None;
         let mut in_para = false;
+        let mut hyperlink_url: Option<String> = None;
 
         loop {
             match reader.read_event_into(&mut buf) {
@@ -965,6 +1133,13 @@ impl DocxParser {
                         in_para = true;
                         para_style = None;
                         para_alignment = None;
+                    }
+                    b"w:hyperlink" if in_para => {
+                        hyperlink_url = get_attr(e, b"r:id").and_then(|id| {
+                            self.relationships.iter()
+                                .find(|r| r.id == id)
+                                .map(|r| r.target.clone())
+                        });
                     }
                     b"w:pStyle" if in_para => {
                         para_style = get_attr(e, b"w:val");
@@ -975,6 +1150,7 @@ impl DocxParser {
                     b"w:r" if in_para => {
                         in_run = true;
                         run_ctx = RunCtx::new();
+                        run_ctx.link_url = hyperlink_url.clone();
                     }
                     b"w:t" if in_run => in_text = true,
                     b"w:b" if in_run => run_ctx.bold = !is_val_false(e),
@@ -1021,6 +1197,7 @@ impl DocxParser {
                 }
                 Ok(Event::End(ref e)) => match e.name().as_ref() {
                     b"w:t" => in_text = false,
+                    b"w:hyperlink" => { hyperlink_url = None; }
                     b"w:r" => {
                         in_run = false;
                         let finished_run = std::mem::replace(&mut run_ctx, RunCtx::new());
@@ -1034,6 +1211,8 @@ impl DocxParser {
                             runs: std::mem::take(&mut runs),
                             style: para_style.take(),
                             alignment: para_alignment.take(),
+                            list_level: None,
+                            list_format: None,
                         });
                     }
                     _ => {}
@@ -1083,6 +1262,8 @@ struct ParagraphCtx {
     style: Option<String>,
     alignment: Option<String>,
     has_page_break_after: bool,
+    num_id: Option<u32>,
+    ilvl: Option<u8>,
 }
 
 impl ParagraphCtx {
@@ -1092,14 +1273,18 @@ impl ParagraphCtx {
             style: None,
             alignment: None,
             has_page_break_after: false,
+            num_id: None,
+            ilvl: None,
         }
     }
 
-    fn into_block_element(self) -> BlockElement {
+    fn into_block_element(self, list_level: Option<u8>, list_format: Option<String>) -> BlockElement {
         BlockElement::Paragraph {
             runs: self.runs,
             style: self.style,
             alignment: self.alignment,
+            list_level,
+            list_format,
         }
     }
 }
@@ -1116,6 +1301,7 @@ struct RunCtx {
     highlight: Option<String>,
     footnote_ref: Option<u32>,
     image_id: Option<String>,
+    link_url: Option<String>,
 }
 
 impl RunCtx {
@@ -1132,6 +1318,7 @@ impl RunCtx {
             highlight: None,
             footnote_ref: None,
             image_id: None,
+            link_url: None,
         }
     }
 
@@ -1149,6 +1336,7 @@ impl RunCtx {
             comment_ref: comment_ranges.last().copied(),
             footnote_ref: self.footnote_ref,
             image_id: self.image_id,
+            link_url: self.link_url,
         }
     }
 }
