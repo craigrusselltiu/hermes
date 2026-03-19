@@ -14,6 +14,7 @@ const recentFilesSection = document.getElementById('recent-files-section');
 const recentFilesList = document.getElementById('recent-files-list');
 const statusBanner = document.getElementById('status-banner');
 const fileInfo = document.getElementById('file-info');
+const railToggleBtn = document.getElementById('rail-toggle-btn');
 const themeIcon = document.getElementById('theme-icon');
 const findBar = document.getElementById('find-bar');
 const findInput = document.getElementById('find-input');
@@ -36,6 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
     }
 
+    initializeRail();
     void initializeTheme();
     setupEventListeners();
     setupKeyboardShortcuts();
@@ -46,6 +48,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function setupEventListeners() {
+    railToggleBtn.addEventListener('click', toggleRail);
     document.getElementById('open-file-btn').addEventListener('click', handleOpenFile);
     document.getElementById('welcome-open-btn').addEventListener('click', handleOpenFile);
     document.getElementById('theme-toggle-btn').addEventListener('click', toggleTheme);
@@ -307,6 +310,23 @@ function renderDocument(doc) {
     }
 }
 
+function initializeRail() {
+    const collapsed = localStorage.getItem('hermes-rail-collapsed') === 'true';
+    setRailCollapsed(collapsed);
+}
+
+function toggleRail() {
+    setRailCollapsed(!document.body.classList.contains('rail-collapsed'));
+}
+
+function setRailCollapsed(collapsed) {
+    document.body.classList.toggle('rail-collapsed', collapsed);
+    railToggleBtn.setAttribute('aria-label', collapsed ? 'Expand toolbar' : 'Collapse toolbar');
+    railToggleBtn.setAttribute('title', collapsed ? 'Expand toolbar' : 'Collapse toolbar');
+    railToggleBtn.setAttribute('aria-expanded', String(!collapsed));
+    localStorage.setItem('hermes-rail-collapsed', String(collapsed));
+}
+
 function renderPage(pageBlocks, doc) {
     const page = document.createElement('div');
     page.className = 'page';
@@ -448,9 +468,6 @@ function applyParagraphStyle(el, para, style) {
     if (style?.font_size) {
         el.style.fontSize = style.font_size + 'pt';
     }
-    if (style?.font_family) {
-        el.style.fontFamily = style.font_family;
-    }
     if (style?.bold === true) {
         el.style.fontWeight = 'bold';
     } else if (style?.bold === false) {
@@ -542,7 +559,6 @@ function renderRun(run, container, doc) {
             (span.style.textDecoration ? ' line-through' : 'line-through');
     }
     if (run.font_size) span.style.fontSize = run.font_size + 'pt';
-    if (run.font_family) span.style.fontFamily = run.font_family;
     if (run.color && run.color !== 'auto') span.style.color = '#' + run.color;
     if (run.highlight) {
         span.style.backgroundColor = highlightColorMap[run.highlight] || run.highlight;
@@ -552,7 +568,7 @@ function renderRun(run, container, doc) {
     if (run.comment_ref != null) {
         span.classList.add('commented-text');
         span.dataset.commentId = run.comment_ref;
-        applyCommentThreadStyle(span, getCommentThreadStyle(run.comment_ref));
+        applyCommentThreadStyle(span, getCommentThreadStyle(getCommentThreadId(run.comment_ref)));
     }
 
     container.appendChild(span);
@@ -656,22 +672,37 @@ function renderComments(comments) {
     }
 
     const fragment = document.createDocumentFragment();
-    for (const comment of comments) {
-        const thread = getCommentThreadStyle(comment.id);
-        const el = document.createElement('div');
-        el.className = 'comment-card';
-        el.id = 'comment-' + comment.id;
-        el.dataset.commentId = comment.id;
-        applyCommentThreadStyle(el, thread);
-        el.innerHTML = `
-            <div class="comment-meta">
-                <span class="comment-thread-pill">${escapeHtml(thread.label)}</span>
-                <strong>${escapeHtml(comment.author)}</strong>
-                ${comment.date ? '<span class="comment-date">' + formatDate(comment.date) + '</span>' : ''}
-            </div>
-            <div class="comment-text">${escapeHtml(comment.text)}</div>
-        `;
-        fragment.appendChild(el);
+    const threads = groupCommentsByThread(comments);
+
+    for (const threadComments of threads) {
+        const threadId = getCommentThreadId(threadComments[0]);
+        const thread = getCommentThreadStyle(threadId);
+        const threadEl = document.createElement('section');
+        threadEl.className = 'comment-thread';
+        threadEl.dataset.threadId = threadId;
+        applyCommentThreadStyle(threadEl, thread);
+
+        threadComments.forEach((comment) => {
+            const isReply = isReplyComment(comment);
+            const el = document.createElement('div');
+            el.className = isReply ? 'comment-card is-reply' : 'comment-card';
+            el.id = 'comment-' + comment.id;
+            el.dataset.commentId = comment.id;
+            el.dataset.threadId = threadId;
+            applyCommentThreadStyle(el, thread);
+            el.innerHTML = `
+                <div class="comment-meta">
+                    <span class="comment-thread-pill">${escapeHtml(thread.label)}</span>
+                    ${isReply ? '<span class="comment-reply-pill">Reply</span>' : ''}
+                    <strong>${escapeHtml(comment.author)}</strong>
+                    ${comment.date ? '<span class="comment-date">' + formatDate(comment.date) + '</span>' : ''}
+                </div>
+                <div class="comment-text">${escapeHtml(comment.text)}</div>
+            `;
+            threadEl.appendChild(el);
+        });
+
+        fragment.appendChild(threadEl);
     }
     commentsList.appendChild(fragment);
 }
@@ -731,6 +762,32 @@ function getCommentThreadStyle(commentId) {
         hoverSurface: hexToRgba(color, 0.24),
         label: `Thread ${commentId}`,
     };
+}
+
+function getCommentThreadId(commentOrId) {
+    if (typeof commentOrId === 'object' && commentOrId !== null) {
+        return commentOrId.thread_id ?? commentOrId.threadId ?? commentOrId.id;
+    }
+    return commentOrId;
+}
+
+function groupCommentsByThread(comments) {
+    const groups = new Map();
+
+    comments.forEach((comment) => {
+        const threadId = getCommentThreadId(comment);
+        if (!groups.has(threadId)) {
+            groups.set(threadId, []);
+        }
+        groups.get(threadId).push(comment);
+    });
+
+    return Array.from(groups.values());
+}
+
+function isReplyComment(comment) {
+    const parentId = comment.parent_id ?? comment.parentId;
+    return parentId !== undefined && parentId !== null;
 }
 
 function applyCommentThreadStyle(element, thread) {
@@ -902,15 +959,39 @@ async function setTheme(theme) {
 function applyTheme(theme) {
     if (theme === 'dark') {
         document.body.classList.add('dark-theme');
-        themeIcon.innerHTML = '&#9788;';
+        themeIcon.innerHTML = getThemeIconSvg('dark');
     } else {
         document.body.classList.remove('dark-theme');
-        themeIcon.innerHTML = '&#9789;';
+        themeIcon.innerHTML = getThemeIconSvg('light');
     }
 }
 
 function normalizeTheme(theme) {
     return theme === 'dark' || theme === 'light' ? theme : null;
+}
+
+function getThemeIconSvg(theme) {
+    if (theme === 'dark') {
+        return `
+            <svg viewBox="0 0 24 24">
+                <path d="M14.5 3.5a7.5 7.5 0 1 0 6 11.9 8.5 8.5 0 1 1-6-11.9Z"></path>
+            </svg>
+        `;
+    }
+
+    return `
+        <svg viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="4.25"></circle>
+            <path d="M12 2.75v2.5"></path>
+            <path d="M12 18.75v2.5"></path>
+            <path d="M21.25 12h-2.5"></path>
+            <path d="M5.25 12h-2.5"></path>
+            <path d="M18.54 5.46l-1.77 1.77"></path>
+            <path d="M7.23 16.77l-1.77 1.77"></path>
+            <path d="M18.54 18.54l-1.77-1.77"></path>
+            <path d="M7.23 7.23 5.46 5.46"></path>
+        </svg>
+    `;
 }
 
 // --- Utilities ---

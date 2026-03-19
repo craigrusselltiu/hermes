@@ -68,6 +68,9 @@ pub struct Comment {
     pub author: String,
     pub date: Option<String>,
     pub text: String,
+    pub para_id: Option<String>,
+    pub parent_id: Option<u32>,
+    pub thread_id: Option<u32>,
 }
 
 /// Header or footer content

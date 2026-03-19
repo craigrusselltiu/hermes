@@ -41,14 +41,14 @@ The shipping desktop app uses the code under `src-tauri/`. The repository also c
 ```mermaid
 flowchart LR
     U["User"] --> F["Frontend UI<br/>src/index.html + src/app.js + src/styles.css"]
-    F -->|invoke('open_docx')| T["Tauri Commands<br/>src-tauri/src/main.rs"]
+    F -->|"open_docx IPC"| T["Tauri Commands<br/>src-tauri/src/main.rs"]
     T --> P["DOCX Parser<br/>src-tauri/src/parser.rs"]
     P --> Z["ZIP + OOXML Parts"]
     P --> M["Document Model<br/>src-tauri/src/model.rs"]
     M -->|JSON over IPC| F
     T --> R["Recent Files JSON<br/>app data directory"]
-    F -->|invoke('get_recent_files')| T
-    F -->|invoke('quit_app')| T
+    F -->|"get_recent_files IPC"| T
+    F -->|"quit_app IPC"| T
 ```
 
 ## Runtime Flow

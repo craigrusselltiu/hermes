@@ -95,7 +95,9 @@ impl DocxParser {
 
         document.body = self.parse_document_body()?;
         document.styles = self.parse_styles().unwrap_or_default();
+        let comment_threads = self.parse_comment_threads().unwrap_or_default();
         document.comments = self.parse_comments().unwrap_or_default();
+        self.attach_comment_threads(&mut document.comments, comment_threads);
         let (headers, footers) = self.parse_headers_footers().unwrap_or_default();
         document.headers = headers;
         document.footers = footers;
@@ -552,11 +554,15 @@ impl DocxParser {
                             .unwrap_or(0);
                         let author = get_attr(e, b"w:author").unwrap_or_default();
                         let date = get_attr(e, b"w:date");
+                        let para_id = extract_comment_para_id(e);
                         current = Some(Comment {
                             id,
                             author,
                             date,
                             text: String::new(),
+                            para_id,
+                            parent_id: None,
+                            thread_id: None,
                         });
                         text_buf.clear();
                     }
@@ -598,6 +604,125 @@ impl DocxParser {
         }
 
         Ok(comments)
+    }
+
+    fn parse_comment_threads(&mut self) -> Result<HashMap<String, String>> {
+        let content = match self.read_archive_file("word/commentsExtended.xml") {
+            Ok(c) => c,
+            Err(_) => return Ok(HashMap::new()),
+        };
+
+        let mut reader = Reader::from_str(&content);
+        let mut buf = Vec::new();
+        let mut threads = HashMap::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    if e.name().as_ref() == b"w15:commentEx" {
+                        if let Some(para_id) = extract_comment_para_id(e) {
+                            if let Some(parent_para_id) = extract_comment_parent_para_id(e) {
+                                threads.insert(para_id, parent_para_id);
+                            } else {
+                                threads.entry(para_id).or_insert_with(String::new);
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(threads)
+    }
+
+    fn attach_comment_threads(
+        &self,
+        comments: &mut [Comment],
+        comment_threads: HashMap<String, String>,
+    ) {
+        let para_to_comment_id: HashMap<String, u32> = comments
+            .iter()
+            .filter_map(|comment| {
+                comment
+                    .para_id
+                    .as_ref()
+                    .map(|para_id| (para_id.clone(), comment.id))
+            })
+            .collect();
+
+        let mut thread_cache: HashMap<String, Option<u32>> = HashMap::new();
+        let mut thread_visited: HashSet<String> = HashSet::new();
+
+        for comment in comments.iter_mut() {
+            let Some(para_id) = comment.para_id.as_ref() else {
+                comment.parent_id = None;
+                comment.thread_id = Some(comment.id);
+                continue;
+            };
+
+            let parent_para_id = comment_threads
+                .get(para_id)
+                .filter(|parent| !parent.is_empty())
+                .cloned();
+
+            comment.parent_id = parent_para_id
+                .as_ref()
+                .and_then(|parent_para_id| para_to_comment_id.get(parent_para_id).copied());
+
+            comment.thread_id = Some(self.resolve_thread_id(
+                para_id,
+                &comment_threads,
+                &para_to_comment_id,
+                &mut thread_cache,
+                &mut thread_visited,
+                comment.id,
+            ));
+        }
+    }
+
+    fn resolve_thread_id(
+        &self,
+        para_id: &str,
+        comment_threads: &HashMap<String, String>,
+        para_to_comment_id: &HashMap<String, u32>,
+        cache: &mut HashMap<String, Option<u32>>,
+        visited: &mut HashSet<String>,
+        fallback_comment_id: u32,
+    ) -> u32 {
+        if !visited.insert(para_id.to_string()) {
+            return fallback_comment_id;
+        }
+
+        if let Some(cached) = cache.get(para_id) {
+            visited.remove(para_id);
+            return cached.unwrap_or(fallback_comment_id);
+        }
+
+        let resolved = match comment_threads.get(para_id) {
+            Some(parent_para_id) if !parent_para_id.is_empty() => {
+                if let Some(&parent_comment_id) = para_to_comment_id.get(parent_para_id) {
+                    self.resolve_thread_id(
+                        parent_para_id,
+                        comment_threads,
+                        para_to_comment_id,
+                        cache,
+                        visited,
+                        parent_comment_id,
+                    )
+                } else {
+                    fallback_comment_id
+                }
+            }
+            _ => fallback_comment_id,
+        };
+
+        cache.insert(para_id.to_string(), Some(resolved));
+        visited.remove(para_id);
+        resolved
     }
 
     // --- Images ---
@@ -1078,6 +1203,14 @@ fn extract_font_family(e: &BytesStart) -> Option<String> {
         .or_else(|| get_attr(e, b"w:cs"))
 }
 
+fn extract_comment_para_id(e: &BytesStart) -> Option<String> {
+    get_attr(e, b"w15:paraId").or_else(|| get_attr(e, b"w:paraId"))
+}
+
+fn extract_comment_parent_para_id(e: &BytesStart) -> Option<String> {
+    get_attr(e, b"w15:paraIdParent").or_else(|| get_attr(e, b"w:paraIdParent"))
+}
+
 fn is_val_false(e: &BytesStart) -> bool {
     match get_attr(e, b"w:val") {
         Some(v) => v == "0" || v == "false",
@@ -1165,7 +1298,10 @@ mod tests {
     #[test]
     fn test_parse_preserves_trailing_spaces_and_font_family() {
         let docx_path = write_test_docx(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            &[
+                (
+                    "word/document.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
     <w:p>
@@ -1181,6 +1317,8 @@ mod tests {
     </w:p>
   </w:body>
 </w:document>"#,
+                ),
+            ],
         );
 
         let mut parser = DocxParser::from_path(docx_path.to_str().unwrap()).expect("parser init");
@@ -1201,7 +1339,67 @@ mod tests {
         let _ = fs::remove_file(docx_path);
     }
 
-    fn write_test_docx(document_xml: &str) -> PathBuf {
+    #[test]
+    fn test_parse_comment_threads_from_comments_extended() {
+        let docx_path = write_test_docx(
+            &[
+                (
+                    "word/document.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Threaded comments</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#,
+                ),
+                (
+                    "word/comments.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">
+  <w:comment w:id="0" w:author="Alice" w15:paraId="11111111">
+    <w:p><w:r><w:t>Root comment</w:t></w:r></w:p>
+  </w:comment>
+  <w:comment w:id="1" w:author="Bob" w15:paraId="22222222">
+    <w:p><w:r><w:t>First reply</w:t></w:r></w:p>
+  </w:comment>
+  <w:comment w:id="2" w:author="Cara" w15:paraId="33333333">
+    <w:p><w:r><w:t>Nested reply</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>"#,
+                ),
+                (
+                    "word/commentsExtended.xml",
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">
+  <w15:commentEx w15:paraId="11111111"/>
+  <w15:commentEx w15:paraId="22222222" w15:paraIdParent="11111111"/>
+  <w15:commentEx w15:paraId="33333333" w15:paraIdParent="22222222"/>
+</w15:commentsEx>"#,
+                ),
+            ],
+        );
+
+        let mut parser = DocxParser::from_path(docx_path.to_str().unwrap()).expect("parser init");
+        let document = parser.parse().expect("parse document");
+
+        assert_eq!(document.comments.len(), 3);
+        assert_eq!(document.comments[0].para_id.as_deref(), Some("11111111"));
+        assert_eq!(document.comments[0].parent_id, None);
+        assert_eq!(document.comments[0].thread_id, Some(0));
+
+        assert_eq!(document.comments[1].para_id.as_deref(), Some("22222222"));
+        assert_eq!(document.comments[1].parent_id, Some(0));
+        assert_eq!(document.comments[1].thread_id, Some(0));
+
+        assert_eq!(document.comments[2].para_id.as_deref(), Some("33333333"));
+        assert_eq!(document.comments[2].parent_id, Some(1));
+        assert_eq!(document.comments[2].thread_id, Some(0));
+
+        let _ = fs::remove_file(docx_path);
+    }
+
+    fn write_test_docx(files: &[(&str, &str)]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "hermes-parser-test-{}-{}.docx",
             std::process::id(),
@@ -1215,10 +1413,12 @@ mod tests {
         let mut zip = zip::ZipWriter::new(file);
         let options: FileOptions<'_, ()> = FileOptions::default();
 
-        zip.start_file("word/document.xml", options)
-            .expect("start document.xml");
-        zip.write_all(document_xml.as_bytes())
-            .expect("write document.xml");
+        for &(file_name, content) in files {
+            zip.start_file(file_name, options)
+                .expect("start zip file");
+            zip.write_all(content.as_bytes())
+                .expect("write zip file");
+        }
         zip.finish().expect("finish docx");
 
         path
