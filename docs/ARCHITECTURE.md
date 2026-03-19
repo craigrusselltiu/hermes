@@ -55,11 +55,16 @@ flowchart LR
 
 ### 1. App Startup
 
-`src-tauri/src/main.rs` builds the Tauri app, installs the dialog and filesystem plugins, and registers three commands:
+`src-tauri/src/main.rs` builds the Tauri app, installs the dialog and filesystem plugins, and registers the IPC commands. The main window starts hidden (`visible: false` in `tauri.conf.json`) to avoid showing a blank frame while the WebView2 runtime initializes on first launch.
 
-- `open_docx`
-- `get_recent_files`
-- `quit_app`
+The frontend initialization in `src/app.js` runs the following sequence:
+
+1. set up event listeners, keyboard shortcuts, and drag-and-drop (synchronous)
+2. load theme preference and recent files in parallel (`Promise.allSettled`)
+3. call `show_main_window` to reveal the fully rendered window
+4. check for a launch document path and load it if present
+
+This means the user never sees a blank or partially rendered window. An inline script in `index.html` also applies the dark theme from `localStorage` before any paint to prevent a flash of the wrong theme.
 
 In debug builds, the main webview opens devtools automatically.
 
@@ -140,6 +145,7 @@ The backend command layer in `src-tauri/src/main.rs` is intentionally thin:
 
 - `open_docx` parses the file and stores it in recent files
 - `get_recent_files` reads persisted history
+- `show_main_window` reveals the window after the frontend is ready
 - `quit_app` exits the application
 
 This keeps document parsing in `parser.rs` and UI logic in the frontend.
@@ -248,6 +254,12 @@ Hermes is intentionally built around a small runtime and a fairly direct renderi
 - Unsupported EMF and WMF images are replaced with lightweight placeholder data URIs instead of attempting expensive conversion work in-process.
 - OOXML parts are parsed with `quick-xml`'s event reader, which keeps parsing logic streaming-oriented and avoids building a full XML DOM in memory.
 - Style inheritance is resolved once in Rust before the model reaches the frontend, which reduces repeated style lookup and merge work during rendering.
+
+### Startup Optimization
+
+- The main window starts hidden and is only shown after the frontend has loaded theme and recent files data, eliminating the blank window flash during WebView2 cold start.
+- Theme preference is applied from `localStorage` via an inline script in `<head>`, before any CSS paint occurs, which prevents a flash of the wrong theme.
+- Theme and recent files load concurrently via `Promise.allSettled` to minimize time-to-visible.
 
 ### Frontend Measures
 

@@ -92,6 +92,13 @@ fn set_theme_preference(theme: String, app: tauri::AppHandle) -> Result<(), Stri
 }
 
 #[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+    }
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -224,6 +231,7 @@ fn main() {
             get_launch_docx_path,
             get_theme_preference,
             set_theme_preference,
+            show_main_window,
             quit_app
         ])
         .setup(|_app| {

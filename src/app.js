@@ -30,18 +30,23 @@ let findDebounceTimer = null;
 
 // --- Initialization ---
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     if (!hasTauriApi()) {
         reportMissingTauriApi();
         return;
     }
 
-    void initializeTheme();
     setupEventListeners();
     setupKeyboardShortcuts();
     setupTauriListeners();
     setupDragAndDrop();
-    void loadRecentFiles();
+
+    await Promise.allSettled([
+        initializeTheme(),
+        loadRecentFiles(),
+    ]);
+
+    invoke('show_main_window').catch(() => {});
     void openLaunchDocument();
 });
 
@@ -861,9 +866,11 @@ async function setTheme(theme) {
 
 function applyTheme(theme) {
     if (theme === 'dark') {
+        document.documentElement.classList.add('dark-theme');
         document.body.classList.add('dark-theme');
         themeIcon.innerHTML = getThemeIconSvg('dark');
     } else {
+        document.documentElement.classList.remove('dark-theme');
         document.body.classList.remove('dark-theme');
         themeIcon.innerHTML = getThemeIconSvg('light');
     }

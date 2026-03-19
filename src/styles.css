@@ -486,7 +486,7 @@ body.drag-over::after {
 }
 
 /* Dark theme */
-body.dark-theme {
+:is(html, body).dark-theme {
     --bg: #151a29;
     --surface-bg: #1d2436;
     --page-bg: #ffffff;
@@ -500,17 +500,17 @@ body.dark-theme {
     --link-color: #8b9cf7;
 }
 
-body.dark-theme .page { box-shadow: 0 2px 12px rgba(0,0,0,0.3); }
-body.dark-theme .doc-table td { border-color: #555; }
-body.dark-theme .tool-rail-btn:hover {
+:is(html, body).dark-theme .page { box-shadow: 0 2px 12px rgba(0,0,0,0.3); }
+:is(html, body).dark-theme .doc-table td { border-color: #555; }
+:is(html, body).dark-theme .tool-rail-btn:hover {
     background: rgba(255,255,255,0.06);
     border-color: #64748b;
     box-shadow: 0 10px 18px rgba(0,0,0,0.22);
 }
-body.dark-theme .status-banner {
+:is(html, body).dark-theme .status-banner {
     background: rgba(23, 28, 51, 0.98);
 }
-body.dark-theme .doc-empty-state {
+:is(html, body).dark-theme .doc-empty-state {
     background: rgba(0,0,0,0.03);
 }
 
