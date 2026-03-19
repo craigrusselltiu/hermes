@@ -14,7 +14,6 @@ const recentFilesSection = document.getElementById('recent-files-section');
 const recentFilesList = document.getElementById('recent-files-list');
 const statusBanner = document.getElementById('status-banner');
 const fileInfo = document.getElementById('file-info');
-const railToggleBtn = document.getElementById('rail-toggle-btn');
 const themeIcon = document.getElementById('theme-icon');
 const findBar = document.getElementById('find-bar');
 const findInput = document.getElementById('find-input');
@@ -37,7 +36,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
     }
 
-    initializeRail();
     void initializeTheme();
     setupEventListeners();
     setupKeyboardShortcuts();
@@ -48,7 +46,6 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function setupEventListeners() {
-    railToggleBtn.addEventListener('click', toggleRail);
     document.getElementById('open-file-btn').addEventListener('click', handleOpenFile);
     document.getElementById('welcome-open-btn').addEventListener('click', handleOpenFile);
     document.getElementById('theme-toggle-btn').addEventListener('click', toggleTheme);
@@ -310,23 +307,6 @@ function renderDocument(doc) {
     }
 }
 
-function initializeRail() {
-    const collapsed = localStorage.getItem('hermes-rail-collapsed') === 'true';
-    setRailCollapsed(collapsed);
-}
-
-function toggleRail() {
-    setRailCollapsed(!document.body.classList.contains('rail-collapsed'));
-}
-
-function setRailCollapsed(collapsed) {
-    document.body.classList.toggle('rail-collapsed', collapsed);
-    railToggleBtn.setAttribute('aria-label', collapsed ? 'Expand toolbar' : 'Collapse toolbar');
-    railToggleBtn.setAttribute('title', collapsed ? 'Expand toolbar' : 'Collapse toolbar');
-    railToggleBtn.setAttribute('aria-expanded', String(!collapsed));
-    localStorage.setItem('hermes-rail-collapsed', String(collapsed));
-}
-
 function renderPage(pageBlocks, doc) {
     const page = document.createElement('div');
     page.className = 'page';
@@ -568,7 +548,6 @@ function renderRun(run, container, doc) {
     if (run.comment_ref != null) {
         span.classList.add('commented-text');
         span.dataset.commentId = run.comment_ref;
-        applyCommentThreadStyle(span, getCommentThreadStyle(getCommentThreadId(run.comment_ref)));
     }
 
     container.appendChild(span);
@@ -651,17 +630,6 @@ const highlightColorMap = {
     black: '#000000',
 };
 
-const commentThreadPalette = [
-    '#2563eb',
-    '#dc2626',
-    '#059669',
-    '#d97706',
-    '#7c3aed',
-    '#db2777',
-    '#0891b2',
-    '#65a30d',
-];
-
 // --- Comments ---
 
 function renderComments(comments) {
@@ -672,37 +640,19 @@ function renderComments(comments) {
     }
 
     const fragment = document.createDocumentFragment();
-    const threads = groupCommentsByThread(comments);
-
-    for (const threadComments of threads) {
-        const threadId = getCommentThreadId(threadComments[0]);
-        const thread = getCommentThreadStyle(threadId);
-        const threadEl = document.createElement('section');
-        threadEl.className = 'comment-thread';
-        threadEl.dataset.threadId = threadId;
-        applyCommentThreadStyle(threadEl, thread);
-
-        threadComments.forEach((comment) => {
-            const isReply = isReplyComment(comment);
-            const el = document.createElement('div');
-            el.className = isReply ? 'comment-card is-reply' : 'comment-card';
-            el.id = 'comment-' + comment.id;
-            el.dataset.commentId = comment.id;
-            el.dataset.threadId = threadId;
-            applyCommentThreadStyle(el, thread);
-            el.innerHTML = `
-                <div class="comment-meta">
-                    <span class="comment-thread-pill">${escapeHtml(thread.label)}</span>
-                    ${isReply ? '<span class="comment-reply-pill">Reply</span>' : ''}
-                    <strong>${escapeHtml(comment.author)}</strong>
-                    ${comment.date ? '<span class="comment-date">' + formatDate(comment.date) + '</span>' : ''}
-                </div>
-                <div class="comment-text">${escapeHtml(comment.text)}</div>
-            `;
-            threadEl.appendChild(el);
-        });
-
-        fragment.appendChild(threadEl);
+    for (const comment of comments) {
+        const el = document.createElement('div');
+        el.className = 'comment-card';
+        el.id = 'comment-' + comment.id;
+        el.dataset.commentId = comment.id;
+        el.innerHTML = `
+            <div class="comment-meta">
+                <strong>${escapeHtml(comment.author)}</strong>
+                ${comment.date ? '<span class="comment-date">' + formatDate(comment.date) + '</span>' : ''}
+            </div>
+            <div class="comment-text">${escapeHtml(comment.text)}</div>
+        `;
+        fragment.appendChild(el);
     }
     commentsList.appendChild(fragment);
 }
@@ -747,53 +697,6 @@ function handleCommentListClick(event) {
     if (commentId) {
         scrollToCommentedText(commentId);
     }
-}
-
-function getCommentThreadStyle(commentId) {
-    const numericId = Number(commentId);
-    const paletteIndex = Number.isFinite(numericId)
-        ? Math.abs(numericId) % commentThreadPalette.length
-        : 0;
-    const color = commentThreadPalette[paletteIndex];
-
-    return {
-        color,
-        surface: hexToRgba(color, 0.16),
-        hoverSurface: hexToRgba(color, 0.24),
-        label: `Thread ${commentId}`,
-    };
-}
-
-function getCommentThreadId(commentOrId) {
-    if (typeof commentOrId === 'object' && commentOrId !== null) {
-        return commentOrId.thread_id ?? commentOrId.threadId ?? commentOrId.id;
-    }
-    return commentOrId;
-}
-
-function groupCommentsByThread(comments) {
-    const groups = new Map();
-
-    comments.forEach((comment) => {
-        const threadId = getCommentThreadId(comment);
-        if (!groups.has(threadId)) {
-            groups.set(threadId, []);
-        }
-        groups.get(threadId).push(comment);
-    });
-
-    return Array.from(groups.values());
-}
-
-function isReplyComment(comment) {
-    const parentId = comment.parent_id ?? comment.parentId;
-    return parentId !== undefined && parentId !== null;
-}
-
-function applyCommentThreadStyle(element, thread) {
-    element.style.setProperty('--thread-color', thread.color);
-    element.style.setProperty('--thread-surface', thread.surface);
-    element.style.setProperty('--thread-hover-surface', thread.hoverSurface);
 }
 
 // --- Find ---
@@ -995,19 +898,6 @@ function getThemeIconSvg(theme) {
 }
 
 // --- Utilities ---
-
-function hexToRgba(hex, alpha) {
-    const normalized = String(hex).replace('#', '');
-    if (!/^[\da-fA-F]{6}$/.test(normalized)) {
-        return `rgba(255, 243, 205, ${alpha})`;
-    }
-
-    const intValue = parseInt(normalized, 16);
-    const r = (intValue >> 16) & 255;
-    const g = (intValue >> 8) & 255;
-    const b = intValue & 255;
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
 
 function escapeHtml(text) {
     const d = document.createElement('div');
