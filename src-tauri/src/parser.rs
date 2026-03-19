@@ -4,8 +4,9 @@ use crate::model::{
 use base64::Engine;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use zip::ZipArchive;
 
 #[derive(Debug, Clone)]
@@ -52,29 +53,28 @@ impl From<quick_xml::Error> for ParseError {
 pub type Result<T> = std::result::Result<T, ParseError>;
 
 pub struct DocxParser {
-    archive: ZipArchive<Cursor<Vec<u8>>>,
+    archive: ZipArchive<File>,
     relationships: Vec<Relationship>,
+    referenced_image_ids: HashSet<String>,
 }
 
 impl DocxParser {
     pub fn from_path(path: &str) -> Result<Self> {
-        let mut buffer = Vec::new();
-        std::fs::File::open(path)
-            .map_err(ParseError::FileNotFound)?
-            .read_to_end(&mut buffer)
-            .map_err(ParseError::FileNotFound)?;
+        let file = File::open(path).map_err(ParseError::FileNotFound)?;
+        let file_size = file.metadata().map_err(ParseError::FileNotFound)?.len();
 
-        if buffer.is_empty() {
+        if file_size == 0 {
             return Err(ParseError::EmptyDocument);
         }
-        if buffer.len() > 100 * 1024 * 1024 {
+        if file_size > 100 * 1024 * 1024 {
             return Err(ParseError::DocumentTooLarge("Exceeds 100 MB".into()));
         }
 
-        let archive = ZipArchive::new(Cursor::new(buffer)).map_err(ParseError::NotADocxFile)?;
+        let archive = ZipArchive::new(file).map_err(ParseError::NotADocxFile)?;
         let mut parser = Self {
             archive,
             relationships: Vec::new(),
+            referenced_image_ids: HashSet::new(),
         };
 
         // Validate required files
@@ -96,11 +96,11 @@ impl DocxParser {
         document.body = self.parse_document_body()?;
         document.styles = self.parse_styles().unwrap_or_default();
         document.comments = self.parse_comments().unwrap_or_default();
-        document.images = self.parse_images().unwrap_or_default();
         let (headers, footers) = self.parse_headers_footers().unwrap_or_default();
         document.headers = headers;
         document.footers = footers;
         document.footnotes = self.parse_footnotes().unwrap_or_default();
+        document.images = self.parse_images().unwrap_or_default();
 
         Ok(document)
     }
@@ -110,7 +110,6 @@ impl DocxParser {
     fn parse_document_body(&mut self) -> Result<Vec<BlockElement>> {
         let content = self.read_archive_file("word/document.xml")?;
         let mut reader = Reader::from_str(&content);
-        reader.config_mut().trim_text(true);
 
         let mut body = Vec::new();
         let mut buf = Vec::new();
@@ -189,8 +188,7 @@ impl DocxParser {
                         }
                         b"w:rFonts" => {
                             if let Some(ref mut r) = run_ctx {
-                                r.font_family = get_attr(e, b"w:ascii")
-                                    .or_else(|| get_attr(e, b"w:hAnsi"));
+                                r.font_family = extract_font_family(e);
                             }
                         }
                         b"w:color" => {
@@ -266,7 +264,18 @@ impl DocxParser {
                         // Image references via w:drawing -> ... -> a:blip
                         b"a:blip" => {
                             if let Some(ref mut r) = run_ctx {
-                                r.image_id = get_attr(e, b"r:embed");
+                                if let Some(image_id) = get_attr(e, b"r:embed") {
+                                    self.referenced_image_ids.insert(image_id.clone());
+                                    r.image_id = Some(image_id);
+                                }
+                            }
+                        }
+                        b"v:imagedata" => {
+                            if let Some(ref mut r) = run_ctx {
+                                if let Some(image_id) = get_attr(e, b"r:id") {
+                                    self.referenced_image_ids.insert(image_id.clone());
+                                    r.image_id = Some(image_id);
+                                }
                             }
                         }
 
@@ -388,7 +397,6 @@ impl DocxParser {
 
         let mut styles = HashMap::new();
         let mut reader = Reader::from_str(&content);
-        reader.config_mut().trim_text(true);
         let mut buf = Vec::new();
 
         let mut current_style_id: Option<String> = None;
@@ -448,8 +456,7 @@ impl DocxParser {
                             }
                         }
                         b"w:rFonts" if in_rpr => {
-                            current_style.font_family = get_attr(e, b"w:ascii")
-                                .or_else(|| get_attr(e, b"w:hAnsi"));
+                            current_style.font_family = extract_font_family(e);
                         }
                         b"w:color" if in_rpr => {
                             current_style.color = get_attr(e, b"w:val");
@@ -481,13 +488,12 @@ impl DocxParser {
         let style_ids: Vec<String> = styles.keys().cloned().collect();
         for id in &style_ids {
             let mut resolved = styles.get(id).cloned().unwrap_or_default();
-            let mut visited = vec![id.clone()];
+            let mut visited = HashSet::from([id.clone()]);
             let mut base_id = resolved.based_on.clone();
             while let Some(ref bid) = base_id {
-                if visited.contains(bid) {
+                if !visited.insert(bid.clone()) {
                     break; // cycle
                 }
-                visited.push(bid.clone());
                 if let Some(base) = styles.get(bid) {
                     if resolved.font_size.is_none() {
                         resolved.font_size = base.font_size;
@@ -531,7 +537,6 @@ impl DocxParser {
 
         let mut comments = Vec::new();
         let mut reader = Reader::from_str(&content);
-        reader.config_mut().trim_text(true);
         let mut buf = Vec::new();
 
         let mut current: Option<Comment> = None;
@@ -600,36 +605,38 @@ impl DocxParser {
     fn parse_images(&mut self) -> Result<HashMap<String, String>> {
         let mut images = HashMap::new();
 
-        for rel in &self.relationships.clone() {
-            if !rel.rel_type.contains("image") && !rel.target.starts_with("media/") {
-                continue;
-            }
+        let image_relationships: Vec<(String, String)> = self
+            .relationships
+            .iter()
+            .filter(|rel| {
+                self.referenced_image_ids.contains(&rel.id)
+                    && (rel.rel_type.contains("image") || rel.target.starts_with("media/"))
+            })
+            .map(|rel| (rel.id.clone(), rel.target.clone()))
+            .collect();
 
-            let full_path = if rel.target.starts_with("media/") {
-                format!("word/{}", rel.target)
-            } else if rel.target.starts_with("word/") {
-                rel.target.clone()
+        for (rel_id, target) in image_relationships {
+            let full_path = if target.starts_with("media/") {
+                format!("word/{}", target)
+            } else if target.starts_with("word/") {
+                target
             } else {
-                format!("word/{}", rel.target)
+                format!("word/{}", target)
             };
 
             let lower = full_path.to_lowercase();
             if lower.ends_with(".emf") || lower.ends_with(".wmf") {
-                images.insert(rel.id.clone(), self.placeholder_data_uri(&full_path));
+                images.insert(rel_id, self.placeholder_data_uri(&full_path));
                 continue;
             }
 
-            match self.archive.by_name(&full_path) {
-                Ok(mut file) => {
-                    let mut buffer = Vec::new();
-                    if file.read_to_end(&mut buffer).is_ok() {
-                        let mime = mime_for_path(&full_path);
-                        let b64 =
-                            base64::engine::general_purpose::STANDARD.encode(&buffer);
-                        images.insert(rel.id.clone(), format!("data:{};base64,{}", mime, b64));
-                    }
+            if let Ok(mut file) = self.archive.by_name(&full_path) {
+                let mut buffer = Vec::new();
+                if file.read_to_end(&mut buffer).is_ok() {
+                    let mime = mime_for_path(&full_path);
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&buffer);
+                    images.insert(rel_id, format!("data:{};base64,{}", mime, b64));
                 }
-                Err(_) => {}
             }
         }
 
@@ -642,23 +649,29 @@ impl DocxParser {
         let mut headers = Vec::new();
         let mut footers = Vec::new();
 
-        // Find header/footer relationships
-        for rel in &self.relationships.clone() {
-            let is_header = rel.rel_type.contains("header");
-            let is_footer = rel.rel_type.contains("footer");
-            if !is_header && !is_footer {
-                continue;
-            }
+        let header_footer_relationships: Vec<(bool, String)> = self
+            .relationships
+            .iter()
+            .filter_map(|rel| {
+                let is_header = rel.rel_type.contains("header");
+                let is_footer = rel.rel_type.contains("footer");
+                if !is_header && !is_footer {
+                    return None;
+                }
 
-            let path = if rel.target.starts_with("word/") {
-                rel.target.clone()
-            } else {
-                format!("word/{}", rel.target)
-            };
+                let full_path = if rel.target.starts_with("word/") {
+                    rel.target.clone()
+                } else {
+                    format!("word/{}", rel.target)
+                };
+                Some((is_header, full_path))
+            })
+            .collect();
 
+        for (is_header, path) in header_footer_relationships {
             if let Ok(content) = self.read_archive_file(&path) {
                 let blocks = self.parse_body_xml(&content);
-                let section = extract_section_number(&rel.target);
+                let section = extract_section_number(&path);
                 let hf = HeaderFooter {
                     content: blocks,
                     section,
@@ -684,7 +697,6 @@ impl DocxParser {
 
         let mut footnotes = Vec::new();
         let mut reader = Reader::from_str(&content);
-        reader.config_mut().trim_text(true);
         let mut buf = Vec::new();
 
         let mut current_id: Option<u32> = None;
@@ -808,14 +820,13 @@ impl DocxParser {
     }
 
     /// Parse a body-like XML fragment (for headers/footers) into BlockElements
-    fn parse_body_xml(&self, content: &str) -> Vec<BlockElement> {
+    fn parse_body_xml(&mut self, content: &str) -> Vec<BlockElement> {
         let mut blocks = Vec::new();
         let mut reader = Reader::from_str(content);
-        reader.config_mut().trim_text(true);
         let mut buf = Vec::new();
 
         let mut runs: Vec<Run> = Vec::new();
-        let mut run_text = String::new();
+        let mut run_ctx = RunCtx::new();
         let mut in_run = false;
         let mut in_text = false;
         let mut para_style: Option<String> = None;
@@ -838,24 +849,59 @@ impl DocxParser {
                     }
                     b"w:r" if in_para => {
                         in_run = true;
-                        run_text.clear();
+                        run_ctx = RunCtx::new();
                     }
                     b"w:t" if in_run => in_text = true,
+                    b"w:b" if in_run => run_ctx.bold = !is_val_false(e),
+                    b"w:i" if in_run => run_ctx.italic = !is_val_false(e),
+                    b"w:u" if in_run => {
+                        let val = get_attr(e, b"w:val");
+                        run_ctx.underline = val.as_deref() != Some("none");
+                    }
+                    b"w:strike" if in_run => run_ctx.strikethrough = !is_val_false(e),
+                    b"w:sz" if in_run => {
+                        if let Some(val) = get_attr(e, b"w:val") {
+                            if let Ok(half_pt) = val.parse::<f32>() {
+                                run_ctx.font_size = Some(half_pt / 2.0);
+                            }
+                        }
+                    }
+                    b"w:rFonts" if in_run => {
+                        run_ctx.font_family = extract_font_family(e);
+                    }
+                    b"w:color" if in_run => {
+                        run_ctx.color = get_attr(e, b"w:val");
+                    }
+                    b"w:highlight" if in_run => {
+                        run_ctx.highlight = get_attr(e, b"w:val");
+                    }
+                    b"a:blip" if in_run => {
+                        if let Some(image_id) = get_attr(e, b"r:embed") {
+                            self.referenced_image_ids.insert(image_id.clone());
+                            run_ctx.image_id = Some(image_id);
+                        }
+                    }
+                    b"v:imagedata" if in_run => {
+                        if let Some(image_id) = get_attr(e, b"r:id") {
+                            self.referenced_image_ids.insert(image_id.clone());
+                            run_ctx.image_id = Some(image_id);
+                        }
+                    }
                     _ => {}
                 },
                 Ok(Event::Text(ref e)) if in_text => {
                     if let Ok(t) = e.unescape() {
-                        run_text.push_str(&t);
+                        run_ctx.text.push_str(&t);
                     }
                 }
                 Ok(Event::End(ref e)) => match e.name().as_ref() {
                     b"w:t" => in_text = false,
                     b"w:r" => {
                         in_run = false;
-                        if !run_text.is_empty() {
-                            runs.push(Run::new(run_text.clone()));
+                        let finished_run = std::mem::replace(&mut run_ctx, RunCtx::new());
+                        if !finished_run.text.is_empty() || finished_run.image_id.is_some() {
+                            runs.push(finished_run.into_run(&[]));
                         }
-                        run_text.clear();
                     }
                     b"w:p" => {
                         in_para = false;
@@ -1025,6 +1071,13 @@ fn get_attr(e: &BytesStart, key: &[u8]) -> Option<String> {
     None
 }
 
+fn extract_font_family(e: &BytesStart) -> Option<String> {
+    get_attr(e, b"w:ascii")
+        .or_else(|| get_attr(e, b"w:hAnsi"))
+        .or_else(|| get_attr(e, b"w:eastAsia"))
+        .or_else(|| get_attr(e, b"w:cs"))
+}
+
 fn is_val_false(e: &BytesStart) -> bool {
     match get_attr(e, b"w:val") {
         Some(v) => v == "0" || v == "false",
@@ -1063,6 +1116,11 @@ fn extract_section_number(path: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::FileOptions;
 
     #[test]
     fn test_mime_types() {
@@ -1089,5 +1147,80 @@ mod tests {
         assert_eq!(extract_section_number("header1.xml"), 1);
         assert_eq!(extract_section_number("word/footer2.xml"), 2);
         assert_eq!(extract_section_number("header.xml"), 1); // fallback
+    }
+
+    #[test]
+    fn test_extract_font_family_prefers_actual_font_slots() {
+        let xml = r#"<w:rFonts w:ascii="Aptos" w:eastAsia="Garamond" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
+        let mut reader = Reader::from_str(xml);
+        let mut buf = Vec::new();
+
+        if let Ok(Event::Empty(ref e)) = reader.read_event_into(&mut buf) {
+            assert_eq!(extract_font_family(e), Some("Aptos".to_string()));
+        } else {
+            panic!("expected font element");
+        }
+    }
+
+    #[test]
+    fn test_parse_preserves_trailing_spaces_and_font_family() {
+        let docx_path = write_test_docx(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:eastAsia="Garamond"/>
+        </w:rPr>
+        <w:t xml:space="preserve">traceable </w:t>
+      </w:r>
+      <w:r>
+        <w:t>on</w:t>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>"#,
+        );
+
+        let mut parser = DocxParser::from_path(docx_path.to_str().unwrap()).expect("parser init");
+        let document = parser.parse().expect("parse document");
+
+        let paragraph_runs = match &document.body[0] {
+            BlockElement::Paragraph { runs, .. } => runs,
+            other => panic!("expected paragraph, got {:?}", other),
+        };
+
+        let text = paragraph_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert_eq!(text, "traceable on");
+        assert_eq!(paragraph_runs[0].font_family, Some("Garamond".to_string()));
+
+        let _ = fs::remove_file(docx_path);
+    }
+
+    fn write_test_docx(document_xml: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hermes-parser-test-{}-{}.docx",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+
+        let file = File::create(&path).expect("create docx file");
+        let mut zip = zip::ZipWriter::new(file);
+        let options: FileOptions<'_, ()> = FileOptions::default();
+
+        zip.start_file("word/document.xml", options)
+            .expect("start document.xml");
+        zip.write_all(document_xml.as_bytes())
+            .expect("write document.xml");
+        zip.finish().expect("finish docx");
+
+        path
     }
 }

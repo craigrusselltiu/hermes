@@ -1,7 +1,8 @@
 // Tauri API imports
-const { invoke } = window.__TAURI__.core;
-const { open } = window.__TAURI__.dialog;
-const { listen } = window.__TAURI__.event;
+const tauriApi = window.__TAURI__;
+const invoke = tauriApi?.core?.invoke?.bind(tauriApi.core) ?? null;
+const open = tauriApi?.dialog?.open?.bind(tauriApi.dialog) ?? null;
+const listen = tauriApi?.event?.listen?.bind(tauriApi.event) ?? null;
 
 // DOM refs
 const welcomeScreen = document.getElementById('welcome-screen');
@@ -9,6 +10,9 @@ const documentView = document.getElementById('document-view');
 const desk = document.getElementById('desk');
 const commentsPanel = document.getElementById('comments-panel');
 const commentsList = document.getElementById('comments-list');
+const recentFilesSection = document.getElementById('recent-files-section');
+const recentFilesList = document.getElementById('recent-files-list');
+const statusBanner = document.getElementById('status-banner');
 const fileInfo = document.getElementById('file-info');
 const themeIcon = document.getElementById('theme-icon');
 const findBar = document.getElementById('find-bar');
@@ -21,15 +25,24 @@ let currentFilePath = null;
 let commentsVisible = false;
 let findMatches = [];
 let findIndex = -1;
+let statusTimer = null;
+let findDebounceTimer = null;
 
 // --- Initialization ---
 
 document.addEventListener('DOMContentLoaded', () => {
-    initializeTheme();
+    if (!hasTauriApi()) {
+        reportMissingTauriApi();
+        return;
+    }
+
+    void initializeTheme();
     setupEventListeners();
     setupKeyboardShortcuts();
     setupTauriListeners();
     setupDragAndDrop();
+    void loadRecentFiles();
+    void openLaunchDocument();
 });
 
 function setupEventListeners() {
@@ -41,7 +54,10 @@ function setupEventListeners() {
     document.getElementById('find-close-btn').addEventListener('click', closeFindBar);
     document.getElementById('find-next-btn').addEventListener('click', () => navigateFind(1));
     document.getElementById('find-prev-btn').addEventListener('click', () => navigateFind(-1));
-    findInput.addEventListener('input', performFind);
+    recentFilesList.addEventListener('click', handleRecentFilesClick);
+    desk.addEventListener('click', handleDeskClick);
+    commentsList.addEventListener('click', handleCommentListClick);
+    findInput.addEventListener('input', scheduleFind);
     findInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') navigateFind(e.shiftKey ? -1 : 1);
         if (e.key === 'Escape') closeFindBar();
@@ -54,11 +70,16 @@ function setupKeyboardShortcuts() {
         if (e.ctrlKey && e.key === 'd') { e.preventDefault(); toggleTheme(); }
         if (e.ctrlKey && e.key === ']') { e.preventDefault(); toggleComments(); }
         if (e.ctrlKey && e.key === 'f') { e.preventDefault(); openFindBar(); }
-        if (e.ctrlKey && e.key === 'q') { e.preventDefault(); window.__TAURI__?.process?.exit(0); }
+        if (e.ctrlKey && e.key === 'q') {
+            e.preventDefault();
+            void invoke('quit_app').catch((err) => showError('Could not quit application: ' + err));
+        }
     });
 }
 
 async function setupTauriListeners() {
+    if (!listen) return;
+
     try {
         await listen('tauri://drag-drop', async (event) => {
             const paths = event.payload?.paths || [];
@@ -82,6 +103,11 @@ function setupDragAndDrop() {
 // --- File handling ---
 
 async function handleOpenFile() {
+    if (!open) {
+        showError('Tauri dialog API is unavailable.');
+        return;
+    }
+
     try {
         const selected = await open({
             multiple: false,
@@ -97,97 +123,252 @@ async function handleOpenFile() {
 }
 
 async function loadDocument(path) {
+    if (!invoke) {
+        showError('Tauri command API is unavailable.');
+        return;
+    }
+
     currentFilePath = path;
     fileInfo.textContent = 'Loading...';
+    showStatus('Loading document...', 'loading', 1500);
 
     try {
         const doc = await invoke('open_docx', { path });
         currentDocument = doc;
         fileInfo.textContent = '';
         renderDocument(doc);
+        void loadRecentFiles();
+        showStatus(getFileName(path) + ' opened', 'success', 1800);
     } catch (err) {
         showError(err);
     }
 }
 
 function showError(msg) {
-    fileInfo.textContent = 'Error: ' + msg;
+    const text = typeof msg === 'string' ? msg : (msg?.toString?.() || 'Unknown error');
+    fileInfo.textContent = 'Error: ' + text;
     fileInfo.style.color = '#e74c3c';
+    showStatus(text, 'error');
     setTimeout(() => { fileInfo.style.color = ''; }, 5000);
+}
+
+async function loadRecentFiles() {
+    if (!recentFilesList) return;
+    if (!invoke) {
+        renderRecentFiles([]);
+        return;
+    }
+
+    try {
+        const result = await invoke('get_recent_files');
+        const files = Array.isArray(result)
+            ? result
+            : Array.isArray(result?.files)
+                ? result.files
+                : Array.isArray(result?.recent_files)
+                    ? result.recent_files
+                    : [];
+        renderRecentFiles(files);
+    } catch (err) {
+        renderRecentFiles([]);
+        console.log('Could not load recent files:', err);
+    }
+}
+
+async function openLaunchDocument() {
+    if (!invoke) return;
+
+    try {
+        const launchPath = await invoke('get_launch_docx_path');
+        if (typeof launchPath === 'string' && launchPath.trim().length > 0) {
+            await loadDocument(launchPath);
+        }
+    } catch (err) {
+        console.log('Could not read launch document path:', err);
+    }
+}
+
+function renderRecentFiles(files) {
+    if (!recentFilesList) return;
+
+    const normalized = (files || [])
+        .map((entry) => normalizeRecentFile(entry))
+        .filter(Boolean);
+
+    recentFilesList.replaceChildren();
+
+    if (normalized.length === 0) {
+        recentFilesList.innerHTML = '<p class="recent-files-empty">No recent files yet.</p>';
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    normalized.slice(0, 8).forEach((file) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'recent-file-btn';
+        button.dataset.path = file.path;
+        button.innerHTML = `
+            <span class="recent-file-name">${escapeHtml(file.name)}</span>
+            <span class="recent-file-path">${escapeHtml(file.path)}</span>
+        `;
+        fragment.appendChild(button);
+    });
+
+    recentFilesList.appendChild(fragment);
+}
+
+async function handleRecentFilesClick(event) {
+    const button = event.target.closest('.recent-file-btn');
+    if (!button) return;
+    const path = button.dataset.path;
+    if (path) {
+        await loadDocument(path);
+    }
+}
+
+function normalizeRecentFile(entry) {
+    if (!entry) return null;
+    if (typeof entry === 'string') {
+        return { path: entry, name: getFileName(entry) || entry };
+    }
+    if (typeof entry === 'object') {
+        const path = entry.path || entry.filePath || entry.fullPath || entry.location;
+        if (!path) return null;
+        return {
+            path,
+            name: entry.name || entry.label || getFileName(path) || path,
+        };
+    }
+    return null;
+}
+
+function showStatus(message, kind = 'info', timeoutMs = 2200) {
+    if (!statusBanner) return;
+
+    if (statusTimer) {
+        clearTimeout(statusTimer);
+        statusTimer = null;
+    }
+
+    statusBanner.textContent = message;
+    statusBanner.className = 'status-banner visible status-' + kind;
+
+    if (timeoutMs !== null && timeoutMs !== undefined) {
+        statusTimer = setTimeout(() => {
+            if (statusBanner) {
+                statusBanner.className = 'status-banner';
+                statusBanner.textContent = '';
+            }
+        }, timeoutMs);
+    }
 }
 
 // --- Document rendering ---
 
 function renderDocument(doc) {
+    currentDocument = doc;
     welcomeScreen.style.display = 'none';
     documentView.style.display = 'flex';
-    desk.innerHTML = '';
+    desk.replaceChildren();
+    commentsVisible = false;
+    commentsPanel.style.display = 'none';
+    closeFindBar();
 
-    // Build pages split by PageBreak
     const pages = splitIntoPages(doc.body);
+    const fragment = document.createDocumentFragment();
 
-    pages.forEach((pageBlocks, pageIdx) => {
-        const page = document.createElement('div');
-        page.className = 'page';
-
-        // Header
-        if (doc.headers && doc.headers.length > 0) {
-            const header = document.createElement('div');
-            header.className = 'page-header';
-            renderBlocks(doc.headers[0].content, header, doc);
-            page.appendChild(header);
+    if (!doc.body || doc.body.length === 0 || pages.every(page => page.length === 0)) {
+        fragment.appendChild(renderEmptyDocumentPage());
+    } else {
+        for (const pageBlocks of pages) {
+            fragment.appendChild(renderPage(pageBlocks, doc));
         }
+    }
 
-        // Body content
-        const content = document.createElement('div');
-        content.className = 'page-content';
-        renderBlocks(pageBlocks, content, doc);
-        page.appendChild(content);
-
-        // Footnotes for this page
-        const pageFootnotes = collectFootnotes(pageBlocks, doc.footnotes);
-        if (pageFootnotes.length > 0) {
-            const fnSection = document.createElement('div');
-            fnSection.className = 'page-footnotes';
-            fnSection.appendChild(document.createElement('hr'));
-            pageFootnotes.forEach(fn => {
-                const fnEl = document.createElement('div');
-                fnEl.className = 'footnote';
-                fnEl.id = 'footnote-' + fn.id;
-                const marker = document.createElement('sup');
-                marker.textContent = fn.id;
-                fnEl.appendChild(marker);
-                const fnContent = document.createElement('span');
-                renderBlocks(fn.content, fnContent, doc);
-                fnEl.appendChild(fnContent);
-                fnSection.appendChild(fnEl);
-            });
-            page.appendChild(fnSection);
-        }
-
-        // Footer
-        if (doc.footers && doc.footers.length > 0) {
-            const footer = document.createElement('div');
-            footer.className = 'page-footer';
-            renderBlocks(doc.footers[0].content, footer, doc);
-            page.appendChild(footer);
-        }
-
-        desk.appendChild(page);
-    });
-
-    // Render comments panel
+    desk.appendChild(fragment);
     renderComments(doc.comments);
 
-    // Auto-show comments panel if there are comments
     if (doc.comments && doc.comments.length > 0) {
         commentsVisible = true;
         commentsPanel.style.display = 'flex';
     }
 
-    // Update window title
-    const filename = currentFilePath.split(/[\\/]/).pop();
+    const filename = getFileName(currentFilePath) || 'Hermes';
     document.title = filename + ' - Hermes';
+
+    if (findInput.value.trim()) {
+        scheduleFind();
+    } else {
+        clearFindHighlights();
+        findMatches = [];
+        findIndex = -1;
+        findCount.textContent = '';
+    }
+}
+
+function renderPage(pageBlocks, doc) {
+    const page = document.createElement('div');
+    page.className = 'page';
+
+    if (doc.headers && doc.headers.length > 0) {
+        const header = document.createElement('div');
+        header.className = 'page-header';
+        renderBlocks(doc.headers[0].content, header, doc);
+        page.appendChild(header);
+    }
+
+    const content = document.createElement('div');
+    content.className = 'page-content';
+    renderBlocks(pageBlocks, content, doc);
+    page.appendChild(content);
+
+    const pageFootnotes = collectFootnotes(pageBlocks, doc.footnotes);
+    if (pageFootnotes.length > 0) {
+        const fnSection = document.createElement('div');
+        fnSection.className = 'page-footnotes';
+        fnSection.appendChild(document.createElement('hr'));
+        const fnFragment = document.createDocumentFragment();
+        pageFootnotes.forEach(fn => {
+            const fnEl = document.createElement('div');
+            fnEl.className = 'footnote';
+            fnEl.id = 'footnote-' + fn.id;
+            const marker = document.createElement('sup');
+            marker.textContent = fn.id;
+            fnEl.appendChild(marker);
+            const fnContent = document.createElement('span');
+            renderBlocks(fn.content, fnContent, doc);
+            fnEl.appendChild(fnContent);
+            fnFragment.appendChild(fnEl);
+        });
+        fnSection.appendChild(fnFragment);
+        page.appendChild(fnSection);
+    }
+
+    if (doc.footers && doc.footers.length > 0) {
+        const footer = document.createElement('div');
+        footer.className = 'page-footer';
+        renderBlocks(doc.footers[0].content, footer, doc);
+        page.appendChild(footer);
+    }
+
+    return page;
+}
+
+function renderEmptyDocumentPage() {
+    const page = document.createElement('div');
+    page.className = 'page';
+
+    const content = document.createElement('div');
+    content.className = 'page-content empty-document';
+    content.innerHTML = `
+        <div class="doc-empty-state">
+            <h2>This document is empty</h2>
+            <p>Hermes opened the file, but there is no visible body content to render yet.</p>
+        </div>
+    `;
+    page.appendChild(content);
+    return page;
 }
 
 function splitIntoPages(blocks) {
@@ -214,23 +395,24 @@ function splitIntoPages(blocks) {
 function renderBlocks(blocks, container, doc) {
     if (!blocks) return;
 
+    const fragment = document.createDocumentFragment();
     for (const block of blocks) {
         switch (block.type) {
             case 'paragraph':
-                renderParagraph(block, container, doc);
+                fragment.appendChild(renderParagraph(block, doc));
                 break;
             case 'table':
-                renderTable(block, container, doc);
+                fragment.appendChild(renderTable(block, doc));
                 break;
             case 'page_break':
                 break;
         }
     }
+    container.appendChild(fragment);
 }
 
-function renderParagraph(para, container, doc) {
-    // Determine if heading
-    const style = para.style ? (doc.styles?.[para.style] || null) : null;
+function renderParagraph(para, doc) {
+    const style = resolveParagraphStyle(para, doc);
     const headingLevel = style?.heading_level || detectHeadingLevel(para.style);
 
     let el;
@@ -240,25 +422,87 @@ function renderParagraph(para, container, doc) {
         el = document.createElement('p');
     }
 
-    // Alignment
+    applyParagraphStyle(el, para, style);
+
+    const fragment = document.createDocumentFragment();
+    if (para.runs) {
+        for (const run of para.runs) {
+            renderRun(run, fragment, doc);
+        }
+    }
+
+    if (fragment.childNodes.length === 0) {
+        el.innerHTML = '&nbsp;';
+    } else {
+        el.appendChild(fragment);
+    }
+
+    return el;
+}
+
+function applyParagraphStyle(el, para, style) {
     const align = para.alignment || style?.alignment;
     if (align) {
         el.style.textAlign = align;
     }
+    if (style?.font_size) {
+        el.style.fontSize = style.font_size + 'pt';
+    }
+    if (style?.font_family) {
+        el.style.fontFamily = style.font_family;
+    }
+    if (style?.bold === true) {
+        el.style.fontWeight = 'bold';
+    } else if (style?.bold === false) {
+        el.style.fontWeight = 'normal';
+    }
+    if (style?.italic === true) {
+        el.style.fontStyle = 'italic';
+    } else if (style?.italic === false) {
+        el.style.fontStyle = 'normal';
+    }
+    if (style?.color && style.color !== 'auto') {
+        el.style.color = '#' + style.color;
+    }
+}
 
-    // Render runs
-    if (para.runs) {
-        for (const run of para.runs) {
-            renderRun(run, el, doc);
-        }
+function resolveParagraphStyle(para, doc) {
+    return resolveStyle(para?.style, doc) || getDefaultDocumentStyle(doc);
+}
+
+function resolveStyle(styleId, doc, seen = new Set()) {
+    if (!styleId || !doc?.styles || seen.has(styleId)) {
+        return null;
     }
 
-    // Empty paragraph - add non-breaking space for spacing
-    if (el.childNodes.length === 0) {
-        el.innerHTML = '&nbsp;';
+    const style = doc.styles[styleId];
+    if (!style) {
+        return null;
     }
 
-    container.appendChild(el);
+    seen.add(styleId);
+
+    const parentStyle = style.based_on
+        ? resolveStyle(style.based_on, doc, seen)
+        : null;
+
+    return parentStyle
+        ? { ...parentStyle, ...style, based_on: style.based_on }
+        : style;
+}
+
+function getDefaultDocumentStyle(doc) {
+    if (!doc?.styles) return null;
+
+    return resolveStyle('Normal', doc)
+        || resolveStyle('normal', doc)
+        || findStyleByName(doc.styles, 'normal');
+}
+
+function findStyleByName(styles, styleName) {
+    const target = String(styleName).toLowerCase();
+    const styleId = Object.keys(styles).find((key) => key.toLowerCase() === target);
+    return styleId ? resolveStyle(styleId, { styles }) : null;
 }
 
 function renderRun(run, container, doc) {
@@ -308,17 +552,18 @@ function renderRun(run, container, doc) {
     if (run.comment_ref != null) {
         span.classList.add('commented-text');
         span.dataset.commentId = run.comment_ref;
-        span.addEventListener('click', () => scrollToComment(run.comment_ref));
+        applyCommentThreadStyle(span, getCommentThreadStyle(run.comment_ref));
     }
 
     container.appendChild(span);
 }
 
-function renderTable(table, container, doc) {
+function renderTable(table, doc) {
     const tableEl = document.createElement('table');
     tableEl.className = 'doc-table';
 
     if (table.rows) {
+        const fragment = document.createDocumentFragment();
         for (const row of table.rows) {
             const tr = document.createElement('tr');
             if (row.cells) {
@@ -331,11 +576,12 @@ function renderTable(table, container, doc) {
                     tr.appendChild(td);
                 }
             }
-            tableEl.appendChild(tr);
+            fragment.appendChild(tr);
         }
+        tableEl.appendChild(fragment);
     }
 
-    container.appendChild(tableEl);
+    return tableEl;
 }
 
 function collectFootnotes(blocks, footnotes) {
@@ -389,29 +635,45 @@ const highlightColorMap = {
     black: '#000000',
 };
 
+const commentThreadPalette = [
+    '#2563eb',
+    '#dc2626',
+    '#059669',
+    '#d97706',
+    '#7c3aed',
+    '#db2777',
+    '#0891b2',
+    '#65a30d',
+];
+
 // --- Comments ---
 
 function renderComments(comments) {
-    commentsList.innerHTML = '';
+    commentsList.replaceChildren();
     if (!comments || comments.length === 0) {
         commentsList.innerHTML = '<p class="no-comments">No comments in this document.</p>';
         return;
     }
 
+    const fragment = document.createDocumentFragment();
     for (const comment of comments) {
+        const thread = getCommentThreadStyle(comment.id);
         const el = document.createElement('div');
         el.className = 'comment-card';
         el.id = 'comment-' + comment.id;
+        el.dataset.commentId = comment.id;
+        applyCommentThreadStyle(el, thread);
         el.innerHTML = `
             <div class="comment-meta">
+                <span class="comment-thread-pill">${escapeHtml(thread.label)}</span>
                 <strong>${escapeHtml(comment.author)}</strong>
                 ${comment.date ? '<span class="comment-date">' + formatDate(comment.date) + '</span>' : ''}
             </div>
             <div class="comment-text">${escapeHtml(comment.text)}</div>
         `;
-        el.addEventListener('click', () => scrollToCommentedText(comment.id));
-        commentsList.appendChild(el);
+        fragment.appendChild(el);
     }
+    commentsList.appendChild(fragment);
 }
 
 function toggleComments() {
@@ -438,6 +700,45 @@ function scrollToCommentedText(commentId) {
     }
 }
 
+function handleDeskClick(event) {
+    const commentedText = event.target.closest('.commented-text');
+    if (!commentedText) return;
+    const commentId = commentedText.dataset.commentId;
+    if (commentId != null) {
+        scrollToComment(commentId);
+    }
+}
+
+function handleCommentListClick(event) {
+    const card = event.target.closest('.comment-card');
+    if (!card) return;
+    const commentId = card.id?.replace('comment-', '');
+    if (commentId) {
+        scrollToCommentedText(commentId);
+    }
+}
+
+function getCommentThreadStyle(commentId) {
+    const numericId = Number(commentId);
+    const paletteIndex = Number.isFinite(numericId)
+        ? Math.abs(numericId) % commentThreadPalette.length
+        : 0;
+    const color = commentThreadPalette[paletteIndex];
+
+    return {
+        color,
+        surface: hexToRgba(color, 0.16),
+        hoverSurface: hexToRgba(color, 0.24),
+        label: `Thread ${commentId}`,
+    };
+}
+
+function applyCommentThreadStyle(element, thread) {
+    element.style.setProperty('--thread-color', thread.color);
+    element.style.setProperty('--thread-surface', thread.surface);
+    element.style.setProperty('--thread-hover-surface', thread.hoverSurface);
+}
+
 // --- Find ---
 
 function openFindBar() {
@@ -446,33 +747,69 @@ function openFindBar() {
     findInput.select();
 }
 
-function closeFindBar() {
+function closeFindBar(resetHighlights = true) {
     findBar.style.display = 'none';
-    clearFindHighlights();
-    findMatches = [];
-    findIndex = -1;
-    findCount.textContent = '';
+    if (resetHighlights) {
+        clearFindHighlights();
+        findMatches = [];
+        findIndex = -1;
+        findCount.textContent = '';
+        findInput.value = '';
+    }
+    if (findDebounceTimer) {
+        clearTimeout(findDebounceTimer);
+        findDebounceTimer = null;
+    }
+}
+
+function scheduleFind() {
+    if (findDebounceTimer) {
+        clearTimeout(findDebounceTimer);
+    }
+    findDebounceTimer = setTimeout(performFind, 120);
 }
 
 function performFind() {
     clearFindHighlights();
     const query = findInput.value.trim().toLowerCase();
-    if (!query) { findCount.textContent = ''; findMatches = []; return; }
+    if (!query) {
+        findCount.textContent = '';
+        findMatches = [];
+        findIndex = -1;
+        return;
+    }
 
     findMatches = [];
+    const textNodes = [];
     const walker = document.createTreeWalker(desk, NodeFilter.SHOW_TEXT);
     while (walker.nextNode()) {
-        const node = walker.currentNode;
-        const idx = node.textContent.toLowerCase().indexOf(query);
-        if (idx >= 0) {
-            const range = document.createRange();
-            range.setStart(node, idx);
-            range.setEnd(node, idx + query.length);
+        textNodes.push(walker.currentNode);
+    }
+
+    for (const node of textNodes) {
+        const text = node.textContent;
+        const lowerText = text.toLowerCase();
+        let start = 0;
+        let matchIndex = lowerText.indexOf(query, start);
+        if (matchIndex === -1) continue;
+
+        const fragment = document.createDocumentFragment();
+        while (matchIndex !== -1) {
+            if (matchIndex > start) {
+                fragment.appendChild(document.createTextNode(text.slice(start, matchIndex)));
+            }
             const mark = document.createElement('mark');
             mark.className = 'find-highlight';
-            range.surroundContents(mark);
+            mark.textContent = text.slice(matchIndex, matchIndex + query.length);
+            fragment.appendChild(mark);
             findMatches.push(mark);
+            start = matchIndex + query.length;
+            matchIndex = lowerText.indexOf(query, start);
         }
+        if (start < text.length) {
+            fragment.appendChild(document.createTextNode(text.slice(start)));
+        }
+        node.parentNode.replaceChild(fragment, node);
     }
 
     findCount.textContent = findMatches.length + ' found';
@@ -496,26 +833,73 @@ function highlightCurrentMatch() {
 }
 
 function clearFindHighlights() {
-    document.querySelectorAll('mark.find-highlight').forEach(mark => {
+    if (findDebounceTimer) {
+        clearTimeout(findDebounceTimer);
+        findDebounceTimer = null;
+    }
+    const marks = findMatches.length > 0 ? findMatches : Array.from(document.querySelectorAll('mark.find-highlight'));
+    marks.forEach(mark => {
         const parent = mark.parentNode;
+        if (!parent) return;
         parent.replaceChild(document.createTextNode(mark.textContent), mark);
         parent.normalize();
     });
+    findMatches = [];
 }
 
 // --- Theme ---
 
-function initializeTheme() {
-    const saved = localStorage.getItem('hermes-theme') || 'light';
-    setTheme(saved);
+async function initializeTheme() {
+    const localTheme = normalizeTheme(localStorage.getItem('hermes-theme')) || 'light';
+    applyTheme(localTheme);
+    localStorage.setItem('hermes-theme', localTheme);
+
+    if (!invoke) return;
+
+    try {
+        const savedTheme = normalizeTheme(await invoke('get_theme_preference'));
+        if (!savedTheme) return;
+
+        applyTheme(savedTheme);
+        localStorage.setItem('hermes-theme', savedTheme);
+    } catch (err) {
+        console.log('Could not load theme preference:', err);
+    }
+}
+
+function hasTauriApi() {
+    return Boolean(invoke && open && listen);
+}
+
+function reportMissingTauriApi() {
+    const message = 'Hermes failed to load its Tauri desktop APIs. Rebuild the app after enabling withGlobalTauri in tauri.conf.json.';
+    if (fileInfo) {
+        fileInfo.textContent = message;
+        fileInfo.style.color = '#e74c3c';
+    }
+    showStatus(message, 'error', null);
 }
 
 function toggleTheme() {
     const current = document.body.classList.contains('dark-theme') ? 'dark' : 'light';
-    setTheme(current === 'light' ? 'dark' : 'light');
+    void setTheme(current === 'light' ? 'dark' : 'light');
 }
 
-function setTheme(theme) {
+async function setTheme(theme) {
+    const normalizedTheme = normalizeTheme(theme) || 'light';
+    applyTheme(normalizedTheme);
+    localStorage.setItem('hermes-theme', normalizedTheme);
+
+    if (!invoke) return;
+
+    try {
+        await invoke('set_theme_preference', { theme: normalizedTheme });
+    } catch (err) {
+        console.log('Could not save theme preference:', err);
+    }
+}
+
+function applyTheme(theme) {
     if (theme === 'dark') {
         document.body.classList.add('dark-theme');
         themeIcon.innerHTML = '&#9788;';
@@ -523,10 +907,26 @@ function setTheme(theme) {
         document.body.classList.remove('dark-theme');
         themeIcon.innerHTML = '&#9789;';
     }
-    localStorage.setItem('hermes-theme', theme);
+}
+
+function normalizeTheme(theme) {
+    return theme === 'dark' || theme === 'light' ? theme : null;
 }
 
 // --- Utilities ---
+
+function hexToRgba(hex, alpha) {
+    const normalized = String(hex).replace('#', '');
+    if (!/^[\da-fA-F]{6}$/.test(normalized)) {
+        return `rgba(255, 243, 205, ${alpha})`;
+    }
+
+    const intValue = parseInt(normalized, 16);
+    const r = (intValue >> 16) & 255;
+    const g = (intValue >> 8) & 255;
+    const b = intValue & 255;
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 
 function escapeHtml(text) {
     const d = document.createElement('div');

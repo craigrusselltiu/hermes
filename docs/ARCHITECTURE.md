@@ -308,8 +308,14 @@ cargo check --manifest-path src-tauri/Cargo.toml
 Build the desktop app:
 
 ```bash
-cargo tauri build --manifest-path src-tauri/Cargo.toml
+cargo tauri build
 ```
+
+You can also run that command from `src-tauri/`.
+
+Do not use `cargo tauri build --manifest-path ...`. `cargo-tauri` does not expose Cargo's `--manifest-path` flag as a top-level option.
+
+Do not use `cargo tauri build -- --manifest-path src-tauri/Cargo.toml` either. The `--` forwards arguments to the inner `cargo` invocation, which leads to an invalid relative manifest path in this repository layout.
 
 The checked-in Tauri config currently includes:
 

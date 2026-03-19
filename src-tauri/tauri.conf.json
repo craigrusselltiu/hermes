@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2.0.0",
   "productName": "Hermes",
   "version": "0.0.0",
-  "identifier": "com.hermes.app",
+  "identifier": "com.pepsienjoyer.hermes",
   "build": {
     "frontendDist": "../src",
     "beforeDevCommand": "",
@@ -10,6 +10,7 @@
     "beforeBuildCommand": ""
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -28,19 +29,16 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "category": "Utility",
     "copyright": "",
     "shortDescription": "Convert DOCX files to HTML",
     "longDescription": "A desktop application for converting Microsoft Word DOCX files to HTML with full formatting preservation"
-  },
-  "plugins": {
-    "fs": {
-      "all": false,
-      "readFile": true
-    },
-    "dialog": {
-      "all": false,
-      "open": true
-    }
   }
 }

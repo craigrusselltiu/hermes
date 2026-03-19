@@ -7,60 +7,66 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <header>
-        <div class="header-content">
-            <div class="title-section">
-                <h1>Hermes</h1>
-            </div>
-            <div class="toolbar">
-                <button id="open-file-btn" class="toolbar-btn" title="Open File (Ctrl+O)">
-                    <span>&#128194;</span>
-                </button>
-                <button id="toggle-comments-btn" class="toolbar-btn" title="Toggle Comments (Ctrl+])">
-                    <span>&#128172;</span>
-                </button>
-                <button id="theme-toggle-btn" class="toolbar-btn" title="Toggle Theme (Ctrl+D)">
-                    <span id="theme-icon">&#9789;</span>
-                </button>
-            </div>
-        </div>
-    </header>
+    <aside class="tool-rail" aria-label="Main actions">
+        <button id="open-file-btn" class="tool-rail-btn" title="Open File (Ctrl+O)">
+            <span class="tool-rail-icon">&#128194;</span>
+            <span class="tool-rail-label">Open</span>
+        </button>
+        <button id="toggle-comments-btn" class="tool-rail-btn" title="Toggle Comments (Ctrl+])">
+            <span class="tool-rail-icon">&#128172;</span>
+            <span class="tool-rail-label">Comments</span>
+        </button>
+        <button id="theme-toggle-btn" class="tool-rail-btn" title="Toggle Theme (Ctrl+D)">
+            <span class="tool-rail-icon" id="theme-icon">&#9789;</span>
+            <span class="tool-rail-label">Theme</span>
+        </button>
+    </aside>
 
-    <div class="app-container">
-        <!-- Welcome / empty state -->
-        <div class="welcome-screen" id="welcome-screen">
-            <div class="welcome-content">
-                <h2>Hermes</h2>
-                <p>Lightweight DOCX Viewer</p>
-                <button id="welcome-open-btn" class="primary-btn">Open DOCX File</button>
-                <p class="hint">or drag and drop a .docx file here</p>
-                <p class="file-info" id="file-info"></p>
-            </div>
-        </div>
+    <div class="app-shell">
+        <div class="status-banner" id="status-banner" aria-live="polite" aria-atomic="true"></div>
 
-        <!-- Document view -->
-        <div class="document-view" id="document-view" style="display: none;">
-            <div class="desk" id="desk">
-                <!-- Pages rendered here -->
-            </div>
-            <aside class="comments-panel" id="comments-panel" style="display: none;">
-                <div class="comments-header">
-                    <h3>Comments</h3>
-                    <button id="close-comments-btn" class="close-btn">&times;</button>
+        <div class="app-container">
+            <!-- Welcome / empty state -->
+            <div class="welcome-screen" id="welcome-screen">
+                <div class="welcome-content">
+                    <h2>Hermes</h2>
+                    <p>Lightweight DOCX Viewer</p>
+                    <button id="welcome-open-btn" class="primary-btn">Open DOCX File</button>
+                    <p class="hint">or drag and drop a .docx file here</p>
+                    <div class="recent-files" id="recent-files-section">
+                        <h3>Recent files</h3>
+                        <div class="recent-files-list" id="recent-files-list">
+                            <p class="recent-files-empty">Loading recent files...</p>
+                        </div>
+                    </div>
+                    <p class="file-info" id="file-info"></p>
                 </div>
-                <div class="comments-list" id="comments-list">
-                </div>
-            </aside>
-        </div>
-    </div>
+            </div>
 
-    <!-- Find bar -->
-    <div class="find-bar" id="find-bar" style="display: none;">
-        <input type="text" id="find-input" placeholder="Find in document..." />
-        <span id="find-count"></span>
-        <button id="find-prev-btn">&#9650;</button>
-        <button id="find-next-btn">&#9660;</button>
-        <button id="find-close-btn">&times;</button>
+            <!-- Document view -->
+            <div class="document-view" id="document-view" style="display: none;">
+                <div class="desk" id="desk">
+                    <!-- Pages rendered here -->
+                </div>
+                <aside class="comments-panel" id="comments-panel" style="display: none;">
+                    <div class="comments-header">
+                        <h3>Comments</h3>
+                        <button id="close-comments-btn" class="close-btn">&times;</button>
+                    </div>
+                    <div class="comments-list" id="comments-list">
+                    </div>
+                </aside>
+            </div>
+        </div>
+
+        <!-- Find bar -->
+        <div class="find-bar" id="find-bar" style="display: none;">
+            <input type="text" id="find-input" placeholder="Find in document..." />
+            <span id="find-count"></span>
+            <button id="find-prev-btn">&#9650;</button>
+            <button id="find-next-btn">&#9660;</button>
+            <button id="find-close-btn">&times;</button>
+        </div>
     </div>
 
     <script src="app.js"></script>

@@ -1,4 +1,4 @@
-use crate::models::{Comment, Run, BlockElement};
+use crate::models::{Comment, Run};
 use quick_xml::events::{Event, BytesStart};
 use quick_xml::Reader;
 use std::collections::HashMap;
