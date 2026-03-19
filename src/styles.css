@@ -339,9 +339,11 @@ body {
 
 .doc-list-item {
     display: list-item;
-    padding-left: 1.5em;
+    list-style-position: inside;
 }
 .doc-list-bullet { list-style-type: disc; }
+.doc-list-bullet.doc-list-level-1 { list-style-type: circle; }
+.doc-list-bullet.doc-list-level-2 { list-style-type: square; }
 .doc-list-ordered { list-style-type: decimal; }
 
 .doc-table {

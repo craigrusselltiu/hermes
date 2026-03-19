@@ -435,7 +435,8 @@ function renderParagraph(para, doc) {
     // List item handling
     if (para.list_level != null) {
         el.classList.add('doc-list-item');
-        el.style.marginLeft = (para.list_level * 1.5) + 'em';
+        el.classList.add('doc-list-level-' + para.list_level);
+        el.style.paddingLeft = ((para.list_level + 1) * 1.5) + 'em';
         if (para.list_format === 'bullet') {
             el.classList.add('doc-list-bullet');
         } else if (para.list_format) {
@@ -535,7 +536,10 @@ function renderRun(run, container, doc) {
 
     const span = document.createElement('span');
     span.textContent = run.text;
-    if (hasTabs) span.style.whiteSpace = 'pre';
+    if (hasTabs) {
+        span.style.whiteSpace = 'pre-wrap';
+        span.style.tabSize = '4';
+    }
 
     if (run.bold) span.style.fontWeight = 'bold';
     if (run.italic) span.style.fontStyle = 'italic';

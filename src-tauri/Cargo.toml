@@ -23,3 +23,10 @@ zip = "4"
 quick-xml = "0.36"
 base64 = "0.22"
 thiserror = "1.0"
+
+[profile.dev]
+debug = 1              # Line tables only -- much faster linking
+incremental = true
+
+[profile.dev.package."*"]
+debug = false          # No debug info for dependencies
