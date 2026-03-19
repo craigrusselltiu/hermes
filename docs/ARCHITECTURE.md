@@ -9,7 +9,32 @@ Hermes is a read-only DOCX viewer built as a Tauri desktop app with a Rust parsi
 3. the `Document` is serialized to JSON and returned over Tauri IPC
 4. the frontend renders that model into a paginated reading UI
 
-The repository also contains an older/shared Rust crate at the repo root. The shipping desktop app uses the code under `src-tauri/`.
+The shipping desktop app uses the code under `src-tauri/`. The repository also contains a shared Rust crate at the repo root for parsing experiments and reusable types.
+
+## Repository Layout
+
+- `docs/SPEC.md`
+  Product specification and feature intent.
+- `docs/ARCHITECTURE.md`
+  Architecture, development notes, and current limitations.
+- `src/`
+  Frontend shell, viewer UI, and styling used by the Tauri app.
+- `src-rust/`
+  Shared parser library and demo binary in the root crate.
+- `src-tauri/`
+  Tauri desktop app crate, commands, parser, and document model.
+- `Cargo.toml`
+  Root crate manifest.
+- `config.yaml`
+  Project configuration.
+
+## Tech Stack
+
+- Rust for parsing, data modeling, and desktop app logic
+- Tauri 2 for the desktop shell
+- `zip` and `quick-xml` for DOCX archive and OOXML parsing
+- `serde` and `serde_json` for document model serialization
+- vanilla HTML, CSS, and JavaScript for the frontend
 
 ## System Diagram
 
@@ -25,28 +50,6 @@ flowchart LR
     F -->|invoke('get_recent_files')| T
     F -->|invoke('quit_app')| T
 ```
-
-## Top-Level Layout
-
-### Desktop App
-
-- `src-tauri/src/main.rs`
-  Tauri bootstrap, command registration, and recent-file persistence.
-- `src-tauri/src/parser.rs`
-  DOCX parsing pipeline for the desktop app.
-- `src-tauri/src/model.rs`
-  Serializable document model shared between the backend and frontend.
-- `src/`
-  Static frontend assets rendered inside the Tauri webview.
-
-### Shared Root Crate
-
-- `src-rust/lib.rs`
-- `src-rust/comment_parser.rs`
-- `src-rust/models.rs`
-- `src-rust/main.rs`
-
-This root crate appears to be a reusable parser/demo path rather than the primary desktop runtime. It overlaps conceptually with `src-tauri/src/parser.rs`, so the repo currently has two parsing codepaths.
 
 ## Runtime Flow
 
@@ -93,7 +96,7 @@ invoke('open_docx', { path })
 - `parse_footnotes`
 - `parse_images`
 
-This keeps the parser organized around OOXML parts instead of trying to handle everything in one pass.
+This keeps the parser organized around OOXML parts instead of handling everything in one pass.
 
 ### 4. IPC Boundary
 
@@ -185,7 +188,7 @@ This persistence is managed entirely in `src-tauri/src/main.rs`.
 `src/index.html` defines three main UI regions:
 
 - the header and toolbar
-- the welcome screen / recent files area
+- the welcome screen and recent files area
 - the document view with the desk and comments sidebar
 
 It also includes a floating find bar.
@@ -227,75 +230,104 @@ The frontend owns:
 
 These behaviors are intentionally kept client-side because they mostly operate on already-loaded document state.
 
-## Data and Control Boundaries
+## Performance and Footprint
 
-### Backend Owns
+Hermes is intentionally built around a small runtime and a fairly direct rendering pipeline. There is not a separate recent "performance-only" change list in the visible git history, but the current codebase already includes several performance-oriented measures.
 
-- filesystem access
-- DOCX archive parsing
-- OOXML interpretation
-- image extraction and data URI generation
-- recent-file persistence
-- application lifecycle commands
+### Lightweight Runtime Choices
 
-### Frontend Owns
+- The app uses Tauri and the system webview instead of shipping a heavier browser runtime.
+- The frontend is plain HTML, CSS, and JavaScript, which avoids framework overhead and a frontend build step.
+- The backend returns a compact `Document` JSON model that is already shaped for rendering, so the frontend does not need to do expensive OOXML interpretation work.
 
-- page layout
-- DOM rendering
-- comment navigation UI
-- theme state in the browser context
-- local interaction state such as search matches and panel visibility
+### Parser-Side Measures
 
-### Shared Contract
+- `DocxParser::from_path` rejects empty files and refuses documents larger than `100 MB`, which prevents obviously pathological inputs from consuming excessive memory or CPU.
+- Relationships are parsed once up front and cached in `self.relationships`, instead of reopening and reparsing the relationships file for each feature pass.
+- The parser tracks `referenced_image_ids` while walking document content, then loads only the images that were actually referenced in the rendered document model.
+- Unsupported EMF and WMF images are replaced with lightweight placeholder data URIs instead of attempting expensive conversion work in-process.
+- OOXML parts are parsed with `quick-xml`'s event reader, which keeps parsing logic streaming-oriented and avoids building a full XML DOM in memory.
+- Style inheritance is resolved once in Rust before the model reaches the frontend, which reduces repeated style lookup and merge work during rendering.
 
-The `Document` JSON payload is the handoff between both sides. That contract is the most important point to protect when making changes.
+### Frontend Measures
 
-## Important Design Choices
+- Rendering uses `DocumentFragment` heavily and then appends batched content into the live DOM, which reduces repeated reflow and repaint work.
+- The main document surface is cleared with `replaceChildren()` before a new render, which keeps updates simple and avoids incremental DOM churn from stale nodes.
+- Page grouping is done once per open via `splitIntoPages(doc.body)`, rather than recalculating page structure repeatedly during interaction.
+- In-document find is debounced by `120 ms`, which prevents a full highlight pass on every keystroke while the user is still typing.
+- Recent files are deduplicated and capped at `8` entries, which keeps persistence small and quick to load.
 
-### Manual DOCX Parsing
+### Tradeoffs and Remaining Gaps
 
-Hermes parses DOCX files directly using `zip` and `quick-xml` rather than depending on a high-level DOCX parser abstraction. That choice gives the app control over:
+- OOXML parts are still read into strings before parsing, so Hermes is not fully streaming end-to-end.
+- The frontend currently rerenders the full document on open instead of virtualizing or incrementally updating very large documents.
+- Images are embedded as data URIs for simple rendering, which is convenient but can increase payload size for image-heavy files.
 
-- which OOXML parts are loaded
-- how partial or unsupported content degrades
-- how the frontend-facing model is shaped
+## Development Setup
 
-### No Frontend Build Step
+### Prerequisites
 
-The frontend is plain HTML, CSS, and JavaScript. This keeps the app lightweight and easy to inspect, though it also means:
+You will need:
 
-- less built-in structure for state management
-- fewer abstractions for component reuse
-- manual organization discipline matters more as the UI grows
+- Rust and Cargo
+- Tauri development prerequisites for your platform
+- on Windows, Microsoft Edge WebView2
 
-### Read-Only Scope
+If you do not already have the Tauri CLI installed:
 
-The architecture is intentionally one-way:
+```bash
+cargo install tauri-cli
+```
 
-- input file in
-- parsed document model out
-- render to UI
+### Root Crate
 
-There is no editing pipeline, no document mutation layer, and no save/export path in the current design.
+The root crate contains shared parsing code and a small demo binary.
 
-## Current Rough Edges
+Run tests:
 
-### Dual Parser Paths
+```bash
+cargo test
+```
 
-The repo contains both:
+Run the demo binary:
 
-- a root Rust crate in `src-rust/`
-- the Tauri app parser in `src-tauri/src/`
+```bash
+cargo run
+```
 
-That duplication can confuse ownership and make future parser changes harder to centralize.
+### Desktop App
 
-### Tauri Dev Configuration
+The desktop app lives in `src-tauri/` and uses the static frontend files in `src/`.
 
-`src-tauri/tauri.conf.json` currently points development at `http://localhost:1430` while also setting `frontendDist` to `../src`. That suggests the development flow is not fully settled yet.
+Check the desktop crate:
 
-### Coarse Rendering Updates
+```bash
+cargo check --manifest-path src-tauri/Cargo.toml
+```
 
-The frontend rerenders the whole document on load. That is fine for the current scope, but search, comments, and very large documents may eventually benefit from more incremental strategies.
+Build the desktop app:
+
+```bash
+cargo tauri build --manifest-path src-tauri/Cargo.toml
+```
+
+The checked-in Tauri config currently includes:
+
+- `frontendDist: ../src`
+- `devUrl: http://localhost:1430`
+
+That means `cargo tauri dev` currently expects a frontend dev server at `http://localhost:1430`. If development should use the checked-in static frontend instead, `src-tauri/tauri.conf.json` will need to be adjusted.
+
+## Current Product Boundaries and Limitations
+
+- Hermes is a viewer, not an editor.
+- There is no support for editing or saving back to DOCX.
+- Hermes does not aim for full OOXML compatibility.
+- Macros, embedded OLE content, and similar advanced document features are not supported.
+- Pagination is driven by explicit page breaks rather than a full layout engine.
+- Very large or structurally complex documents may need graceful degradation in the renderer.
+- The repository currently contains both a shared parser crate and a Tauri-specific parser implementation.
+- The development flow around the Tauri dev configuration is still rough.
 
 ## Extension Points
 
@@ -306,14 +338,7 @@ If Hermes grows, the cleanest extension seams are:
 - introducing clearer frontend view modules around rendering and interaction concerns
 - consolidating the shared parser logic so the desktop app and root crate do not drift
 
-## Suggested Near-Term Improvements
-
-- choose a single canonical parser implementation
-- make the Tauri dev/build story consistent
-- separate frontend rendering logic from interaction logic into smaller modules
-- add dedicated tests around the backend `Document` contract and parser stages
-
 ## Related Docs
 
+- `README.md` for end-user installation and usage
 - `docs/SPEC.md` for the product specification
-- `README.md` for setup and repo-level usage
