@@ -55,6 +55,7 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 #[derive(Clone)]
 struct NumberingLevelInfo {
     num_fmt: String,
+    #[allow(dead_code)]
     lvl_text: String,
     start: u32,
 }
